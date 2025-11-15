@@ -18,7 +18,6 @@ import csv
 
 logging.basicConfig(level=logging.INFO)
 
-# Configuration
 #BOT_TOKEN = "7796826213:AAEz8Iakp4yui0iEscwoEqAst6MBSb_00Aw"
 BOT_TOKEN = "8268129348:AAEm22OeiN7mfJlfab05m6khpSrbhmq31Go"
 ADMIN_ID = 7593649217
