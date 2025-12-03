@@ -274,11 +274,19 @@ def get_user_record(user_id: int):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM number_queue WHERE used_by_user_id = %s LIMIT 1",
-                (user_id,)
+                """
+                SELECT * FROM number_queue
+                WHERE used_by_user_id = %s
+                  AND is_used = TRUE
+                  AND is_completed = FALSE
+                ORDER BY used_at DESC, id DESC
+                LIMIT 1
+                """,
+                (user_id,),
             )
             result = cursor.fetchone()
             return result if result else None
+
 
 def mark_line_completed(user_id):
     """Mark a line as permanently completed"""
@@ -444,9 +452,11 @@ def reset_queue():
                        used_at = NULL,
                        status = NULL,
                        call_summary = NULL,
-                       summary_submitted_at = NULL"""
+                       summary_submitted_at = NULL
+                   WHERE is_completed = FALSE"""  # <-- only reset non-completed
             )
             return cursor.rowcount
+
 
 
 def clear_queue():
@@ -2224,21 +2234,22 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
         return
 
     loop = asyncio.get_event_loop()
+
+    # 1) Update status
     await loop.run_in_executor(None, update_record_status, user_id, "No Answer")
-    await loop.run_in_executor(None, mark_line_completed, user_id)
+
+    # 2) Get current record BEFORE completing
+    record = await loop.run_in_executor(None, get_user_record, user_id)
 
     username = callback.from_user.username or callback.from_user.first_name
     user_mention = callback.from_user.mention_html()
 
-    # Get user's current line details
-    record = await loop.run_in_executor(None, get_user_record, user_id)
-
-    # Get user agent name and reference
+    # 3) Get user agent name and reference
     user_info = await loop.run_in_executor(None, get_user_info, user_id)
     agent_name = user_info['agent_name'] if user_info and user_info.get('agent_name') else "Agent"
     reference = user_info['reference'] if user_info else "CB2061"
 
-    # Save no answer record
+    # 4) Save no answer record
     if record:
         await loop.run_in_executor(
             None,
@@ -2253,10 +2264,21 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
             record.get('email')
         )
 
+    # 5) NOW mark the line as completed so it can never be reused
+    await loop.run_in_executor(None, mark_line_completed, user_id)
 
+    # 6) Rest of your existing code
+    try:
+        await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"❌ {user_mention} - No Answer",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Error: {e}")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_new_line_{user_id}")]
+        [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
     ])
 
     await callback.message.edit_text(
@@ -2266,6 +2288,7 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
     )
 
     await callback.answer()
+
 
 
 # REQUEST NEW LINE CALLBACK
