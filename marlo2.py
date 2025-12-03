@@ -271,8 +271,15 @@ def get_user_record(user_id: int):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM number_queue WHERE used_by_user_id = %s LIMIT 1",
-                (user_id,)
+                """
+                SELECT * FROM number_queue
+                WHERE used_by_user_id = %s
+                  AND is_used = TRUE
+                  AND is_completed = FALSE
+                ORDER BY used_at DESC, id DESC
+                LIMIT 1
+                """,
+                (user_id,),
             )
             result = cursor.fetchone()
             return result if result else None
