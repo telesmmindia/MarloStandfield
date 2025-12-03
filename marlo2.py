@@ -282,13 +282,14 @@ def mark_line_completed(user_id):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "UPDATE number_queue SET is_completed = TRUE WHERE used_by_user_id = %s",
+                "UPDATE number_queue SET is_completed = TRUE WHERE used_by_user_id = %s AND is_used = TRUE",
                 (user_id,)
             )
             cursor.execute(
                 "DELETE FROM number_requests WHERE user_id = %s AND status IN ('pending', 'approved')",
                 (user_id,)
             )
+
 
 def get_next_number(user_id: int, username: str = None, force_new: bool = False):
     """
@@ -431,6 +432,7 @@ def get_queue_stats():
 
 
 def reset_queue():
+    """Reset only INCOMPLETE lines (don't reset completed ones)"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -440,10 +442,11 @@ def reset_queue():
                        used_by_username = NULL,
                        used_at = NULL,
                        status = NULL,
-                       call_summary = NULL,
-                       summary_submitted_at = NULL"""
+                       call_summary = NULL
+                   WHERE is_completed = FALSE"""  # Only reset incomplete
             )
             return cursor.rowcount
+
 
 
 def clear_queue():
@@ -1573,6 +1576,23 @@ async def callback_approve_line(callback: CallbackQuery, bot: Bot):
     record = None
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
+
+            # Right before assigning a line, log what's available
+            cursor.execute(
+                "SELECT id, number, is_completed FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE ORDER BY id LIMIT 5"
+            )
+            available = cursor.fetchall()
+            logging.info(f"Available lines for user {user_id}: {available}")
+
+            # Then your existing query
+            cursor.execute(
+                "SELECT id, number, name, address, email FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE ORDER BY id LIMIT 1"
+            )
+            record = cursor.fetchone()
+
+            if record:
+                logging.info(f"Assigning line {record['number']} (ID: {record['id']}) to user {user_id}")
+
             cursor.execute(
                 "SELECT id, number, name, address, email FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE ORDER BY id LIMIT 1"
             )
@@ -2209,7 +2229,6 @@ async def callback_need_pass(callback: CallbackQuery, state: FSMContext, bot: Bo
     await callback.answer()
 
 
-# NO ANSWER CALLBACK
 @router.callback_query(F.data.startswith("noanswer_"))
 async def callback_noanswer(callback: CallbackQuery, bot: Bot):
     user_id = int(callback.data.split("_")[1])
@@ -2219,18 +2238,23 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
         return
 
     loop = asyncio.get_event_loop()
+
+    # STEP 1: Update status
     await loop.run_in_executor(None, update_record_status, user_id, "No Answer")
+
+    # STEP 2: CRITICAL - Mark line as completed IMMEDIATELY
+    await loop.run_in_executor(None, mark_line_completed, user_id)
 
     username = callback.from_user.username or callback.from_user.first_name
     user_mention = callback.from_user.mention_html()
 
-    # Get user's current line details
+    # Get user's current line details BEFORE marking complete
     record = await loop.run_in_executor(None, get_user_record, user_id)
 
     # Get user agent name and reference
     user_info = await loop.run_in_executor(None, get_user_info, user_id)
     agent_name = user_info['agent_name'] if user_info and user_info.get('agent_name') else "Agent"
-    reference = user_info['reference'] if user_info else "LG206187"
+    reference = user_info['reference'] if user_info else REFERENCE
 
     # Save no answer record
     if record:
@@ -2247,10 +2271,17 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
             record.get('email')
         )
 
-
+    try:
+        await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"❌ {user_mention} - No Answer",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Error: {e}")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_new_line_{user_id}")]
+        [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_line")]
     ])
 
     await callback.message.edit_text(
