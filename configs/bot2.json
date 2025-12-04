@@ -1,0 +1,13 @@
+{
+  "bot_token": "8424091690:AAHfg9_8tcxkw-xdUHsCrO7YBQNvreRkDIo",
+  "admin_id": 7593649217,
+  "group_chat_id": -5052070843,
+  "reference": "LG206187",
+  "database": {
+    "host": "localhost",
+    "user": "root",
+    "password": "3kkxb7jdfh",
+    "database": "marlo_ledger",
+    "charset": "utf8mb4"
+  }
+}

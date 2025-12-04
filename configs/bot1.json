@@ -1,0 +1,13 @@
+{
+  "bot_token": "8268129348:AAEm22OeiN7mfJlfab05m6khpSrbhmq31Go",
+  "admin_id": 7593649217,
+  "group_chat_id": -5096149251,
+  "reference": "CB2061",
+  "database": {
+    "host": "localhost",
+    "user": "root",
+    "password": "3kkxb7jdfh",
+    "database": "data",
+    "charset": "utf8mb4"
+  }
+}

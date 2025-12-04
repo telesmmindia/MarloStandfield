@@ -205,7 +205,6 @@ def save_no_answer_record(user_id, username, agent_name, reference, number, name
                 (user_id, username, agent_name, reference, number, name, address, email)
             )
 
-
 def is_admin(user_id):
     """Check if user is an admin (master or regular)"""
     if user_id == ADMIN_ID:
@@ -242,14 +241,11 @@ def get_all_admins():
             cursor.execute("SELECT user_id, username, added_at FROM admins ORDER BY added_at")
             return cursor.fetchall()
 
-
-# Database functions
 def add_numbers_to_queue(numbers_list):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             query = "INSERT INTO number_queue (number) VALUES (%s)"
             cursor.executemany(query, [(num.strip(),) for num in numbers_list])
-
 
 def add_records_from_csv(records_list):
     with get_db_connection() as conn:
@@ -268,7 +264,6 @@ def clear_pending_requests():
             deleted_count = cursor.rowcount
             conn.commit()
             return deleted_count
-
 
 def get_user_record(user_id: int):
     with get_db_connection() as conn:
@@ -331,9 +326,6 @@ def get_next_number(user_id: int, username: str = None, force_new: bool = False)
                 return result
             return None
 
-
-
-
 def update_record_status(user_id: int, status: str):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -341,7 +333,6 @@ def update_record_status(user_id: int, status: str):
                 "UPDATE number_queue SET status = %s WHERE used_by_user_id = %s",
                 (status, user_id)
             )
-
 
 def update_record_summary(user_id: int, summary: str):
     with get_db_connection() as conn:
@@ -352,7 +343,6 @@ def update_record_summary(user_id: int, summary: str):
                    WHERE used_by_user_id = %s""",
                 (summary, user_id)
             )
-
 
 def create_line_request(user_id: int, username: str):
     with get_db_connection() as conn:
@@ -365,7 +355,6 @@ def create_line_request(user_id: int, username: str):
             )
             return cursor.lastrowid
 
-
 def get_request_by_id(request_id: int):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -374,7 +363,6 @@ def get_request_by_id(request_id: int):
                 (request_id,)
             )
             return cursor.fetchone()
-
 
 def update_request_status(request_id: int, status: str):
     with get_db_connection() as conn:
@@ -432,7 +420,6 @@ def get_queue_stats():
 
             return remaining, used
 
-
 def reset_queue():
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -448,14 +435,12 @@ def reset_queue():
             )
             return cursor.rowcount
 
-
 def clear_queue():
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM number_queue")
             cursor.execute("DELETE FROM number_requests")
             return cursor.rowcount
-
 
 def export_used_numbers():
     with get_db_connection() as conn:
@@ -488,7 +473,6 @@ def export_used_numbers():
 
             return output.getvalue(), deleted_count
 
-
 def export_unused_numbers():
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -513,8 +497,6 @@ def export_unused_numbers():
                 output.write(f"{row['number']},{name},\"{address}\",{email}\n")
 
             return output.getvalue(), 0
-
-
 
 def export_all_numbers():
     with get_db_connection() as conn:
@@ -550,10 +532,7 @@ def export_all_numbers():
 
             return output.getvalue(), deleted_count
 
-
-# Router setup
 router = Router()
-
 
 async def set_bot_commands(bot: Bot):
     """Set up bot command menus for different user types"""
@@ -1476,7 +1455,6 @@ async def callback_request_line(callback: CallbackQuery, state: FSMContext, bot:
 
     loop = asyncio.get_event_loop()
 
-    # CHECK 1: Is user in group?
     try:
         member = await bot.get_chat_member(GROUP_CHAT_ID, user_id)
         if member.status == "kicked":
@@ -1662,7 +1640,6 @@ async def callback_approve_line(callback: CallbackQuery, bot: Bot):
             parse_mode="HTML"
         )
 
-    # Delete the approval message for all admins
     try:
         await callback.message.delete()
     except:
@@ -1671,7 +1648,6 @@ async def callback_approve_line(callback: CallbackQuery, bot: Bot):
     await callback.answer("✅ Line approved and sent!")
 
 
-# DECLINE LINE
 @router.callback_query(F.data.startswith("decline_line_"))
 async def callback_decline_line(callback: CallbackQuery, bot: Bot):
     loop = asyncio.get_event_loop()
