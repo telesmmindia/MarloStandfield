@@ -19,9 +19,9 @@ import csv
 logging.basicConfig(level=logging.INFO)
 
 # Configuration
-BOT_TOKEN = "8525908374:AAFj61KCJNXypKM5moKxmWF1fhQk0i6UXQk"
+BOT_TOKEN = "8517589571:AAE8k4MPqV6ZrmBSkD70yoyJdVD4Tn1_zMA"
 ADMIN_ID = 7593649217
-GROUP_CHAT_ID = -5004650273
+GROUP_CHAT_ID = -4889119582
 REFERENCE = 'LG206187'
 
 
@@ -30,7 +30,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
     'password': '3kkxb7jdfh',
-    'database': 'marlo_usa',
+    'database': 'marlo_sendlines',
     'charset': 'utf8mb4',
     'cursorclass': DictCursor
 }
@@ -283,7 +283,6 @@ def get_user_record(user_id: int):
             )
             result = cursor.fetchone()
             return result if result else None
-
 def mark_line_completed(user_id):
     """Mark a line as permanently completed"""
     with get_db_connection() as conn:
