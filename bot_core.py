@@ -21,6 +21,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     BotCommand,
 )
+import io
+import csv
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -598,6 +601,8 @@ class LineBot:
         admin_commands = [
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="line", description="Request a new line"),
+            BotCommand(command="add", description="Add numbers manually"),
+            BotCommand(command="upload", description="Upload CSV/TXT file"),
             BotCommand(command="stats", description="View queue statistics"),
             BotCommand(command="reset", description="Reset all numbers"),
             BotCommand(command="clear", description="Delete all numbers"),
@@ -960,6 +965,254 @@ class LineBot:
                 logging.error(f"Error notifying group: {e}")
 
             await callback.answer()
+
+        @r.callback_query(F.data.startswith("need_pass_"))
+        async def callback_need_pass(callback: CallbackQuery, state: FSMContext):
+            # data: need_pass_{user_id}
+            try:
+                user_id = int(callback.data.split("_")[2])
+            except (IndexError, ValueError):
+                await callback.answer("Invalid data.", show_alert=True)
+                return
+
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_status, user_id, "Need Pass"
+            )
+
+            await state.set_state(UserStates.waiting_for_summary)
+            await callback.message.answer(
+                "⛹️ You selected <b>Need a Pass</b>.\n\n"
+                "Send a short note/pass in one message.\n\n"
+                "Send /cancel to abort.",
+                parse_mode="HTML",
+            )
+            await callback.answer()
+
+        @r.message(UserStates.waiting_for_summary, F.text)
+        async def receive_need_pass_summary(message: Message, state: FSMContext):
+            if message.text.startswith("/cancel"):
+                await state.clear()
+                await message.answer("❌ Cancelled.")
+                return
+
+            summary = message.text.strip()
+            if not summary:
+                await message.answer("❌ Summary cannot be empty.")
+                return
+
+            user_id = message.from_user.id
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_summary, user_id, summary
+            )
+
+            await message.answer(
+                "✅ Pass noted.\n\nYou can continue your call with this info.",
+                parse_mode="HTML",
+            )
+            await state.clear()
+
+        @r.callback_query(F.data.startswith("finishing_"))
+        async def callback_finishing(callback: CallbackQuery, state: FSMContext):
+            # data: finishing_{user_id}
+            try:
+                user_id = int(callback.data.split("_")[1])
+            except (IndexError, ValueError):
+                await callback.answer("Invalid data.", show_alert=True)
+                return
+
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_status, user_id, "Finishing"
+            )
+
+            await state.set_state(UserStates.waiting_for_finishing_summary)
+            await callback.message.answer(
+                "🫡 You selected <b>Finishing</b>.\n\n"
+                "Send a short call summary (result / outcome).\n\n"
+                "Send /cancel to abort.",
+                parse_mode="HTML",
+            )
+            await callback.answer()
+
+        @r.message(UserStates.waiting_for_finishing_summary, F.text)
+        async def receive_finishing_summary(message: Message, state: FSMContext):
+            if message.text.startswith("/cancel"):
+                await state.clear()
+                await message.answer("❌ Cancelled.")
+                return
+
+            summary = message.text.strip()
+            if not summary:
+                await message.answer("❌ Summary cannot be empty.")
+                return
+
+            user_id = message.from_user.id
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_summary, user_id, summary
+            )
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Request Another Line 🔄",
+                            callback_data="request_line",
+                        )
+                    ]
+                ]
+            )
+
+            await message.answer(
+                "✅ Summary saved and line marked as finished.\n\n"
+                "You can request another line.",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            await state.clear()
+
+        @r.callback_query(F.data.startswith("vic_callback_"))
+        async def callback_vic_callback(callback: CallbackQuery, state: FSMContext):
+            # data: vic_callback_{user_id}
+            try:
+                user_id = int(callback.data.split("_")[2])
+            except (IndexError, ValueError):
+                await callback.answer("Invalid data.", show_alert=True)
+                return
+
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_status, user_id, "Vic Callback"
+            )
+
+            await state.set_state(UserStates.waiting_for_callback_summary)
+            await callback.message.answer(
+                "☎️ You selected <b>Vic Needs Callback</b>.\n\n"
+                "Send a short note on the callback requirement.\n\n"
+                "Send /cancel to abort.",
+                parse_mode="HTML",
+            )
+            await callback.answer()
+
+        @r.message(UserStates.waiting_for_callback_summary, F.text)
+        async def receive_callback_summary(message: Message, state: FSMContext):
+            if message.text.startswith("/cancel"):
+                await state.clear()
+                await message.answer("❌ Cancelled.")
+                return
+
+            summary = message.text.strip()
+            if not summary:
+                await message.answer("❌ Summary cannot be empty.")
+                return
+
+            user_id = message.from_user.id
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_summary, user_id, summary
+            )
+            # Typically line is done for this agent; mark completed
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Request Another Line 🔄",
+                            callback_data="request_line",
+                        )
+                    ]
+                ]
+            )
+
+            await message.answer(
+                "✅ Callback note saved and line marked as completed.\n\n"
+                "You can request another line.",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            await state.clear()
+
+        @r.callback_query(F.data.startswith("call_ended_"))
+        async def callback_call_ended(callback: CallbackQuery, state: FSMContext):
+            # data: call_ended_{user_id}
+            try:
+                user_id = int(callback.data.split("_")[2])
+            except (IndexError, ValueError):
+                await callback.answer("Invalid data.", show_alert=True)
+                return
+
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_status, user_id, "Call Ended"
+            )
+
+            await state.set_state(UserStates.waiting_for_call_ended_summary)
+            await callback.message.answer(
+                "📵 You selected <b>Call Ended</b>.\n\n"
+                "Send a short final summary of the call.\n\n"
+                "Send /cancel to abort.",
+                parse_mode="HTML",
+            )
+            await callback.answer()
+
+        @r.message(UserStates.waiting_for_call_ended_summary, F.text)
+        async def receive_call_ended_summary(message: Message, state: FSMContext):
+            if message.text.startswith("/cancel"):
+                await state.clear()
+                await message.answer("❌ Cancelled.")
+                return
+
+            summary = message.text.strip()
+            if not summary:
+                await message.answer("❌ Summary cannot be empty.")
+                return
+
+            user_id = message.from_user.id
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self.update_record_summary, user_id, summary
+            )
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Request Another Line 🔄",
+                            callback_data="request_line",
+                        )
+                    ]
+                ]
+            )
+
+            await message.answer(
+                "✅ Call summary saved and line marked as completed.\n\n"
+                "You can request another line.",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            await state.clear()
+
 
         @r.callback_query(F.data.startswith("noanswer_"))
         async def callback_noanswer(callback: CallbackQuery):
