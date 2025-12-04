@@ -746,6 +746,7 @@ class LineBot:
             user_id = callback.from_user.id
             username = callback.from_user.username or callback.from_user.first_name
 
+            # group membership check (keep as-is)
             try:
                 member = await self.bot.get_chat_member(self.group_chat_id, user_id)
                 if member.status == "kicked":
@@ -761,17 +762,17 @@ class LineBot:
                 await callback.answer()
                 return
 
+            # bot running check (keep)
             status = self.get_bot_status()
             if status == "stopped":
-                await callback.message.answer(
-                    "⏸️ Bot is currently stopped.", parse_mode="HTML"
-                )
+                await callback.message.answer("⏸️ Bot is currently stopped.", parse_mode="HTML")
                 await callback.answer()
                 return
 
             loop = asyncio.get_event_loop()
 
-            def check_can_request_new_line(uid: int):
+            # still prevent multiple active lines for same user
+            def check_has_active_line(uid: int):
                 with self.get_db_connection() as conn:
                     with conn.cursor() as cursor:
                         cursor.execute(
@@ -784,110 +785,59 @@ class LineBot:
                             """,
                             (uid,),
                         )
-                        existing = cursor.fetchone()
-                        if existing:
-                            return False, "already_has_line"
+                        return cursor.fetchone() is not None
 
-                        cursor.execute(
-                            """
-                            SELECT id FROM number_requests
-                            WHERE user_id = %s AND status = 'pending'
-                            LIMIT 1
-                            """,
-                            (uid,),
-                        )
-                            # noqa
-                        pending = cursor.fetchone()
-                        if pending:
-                            return False, "pending_request"
-
-                        return True, None
-
-            can_request, reason = await loop.run_in_executor(
-                None, check_can_request_new_line, user_id
-            )
-            if not can_request:
-                if reason == "already_has_line":
-                    await callback.message.answer(
-                        "❌ You already have an active line! Use it first."
-                    )
-                elif reason == "pending_request":
-                    await callback.message.answer(
-                        "⏳ You already have a pending request! Wait for admin approval."
-                    )
+            has_line = await loop.run_in_executor(None, check_has_active_line, user_id)
+            if has_line:
+                await callback.message.answer("❌ You already have an active line! Use it first.")
                 await callback.answer()
                 return
 
-            def create_request(uid: int, uname: str) -> int:
-                with self.get_db_connection() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(
-                            """
-                            INSERT INTO number_requests (user_id, username, status, requested_at)
-                            VALUES (%s, %s, 'pending', NOW())
-                            """,
-                            (uid, uname),
-                        )
-                        cursor.execute("SELECT LAST_INSERT_ID() AS id")
-                        return cursor.fetchone()["id"]
-
-            request_id = await loop.run_in_executor(
-                None, create_request, user_id, username
+            # DIRECTLY assign next number (no number_requests, no admin approval)
+            record = await loop.run_in_executor(
+                None, self.get_next_number, user_id, username
             )
 
-            async def send_request_to_all_admins(
-                request_id: int, user_mention: str, username: str
-            ):
-                text = (
-                    f"📨 <b>New Line Request</b>\n\n"
-                    f"User: {user_mention}\n"
-                    f"ID: <code>{user_id}</code>\n\n"
-                    f"Reference: <code>{self.reference}</code>\n\n"
-                    f"Approve or decline this request."
-                )
-                kb = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="✅ Approve",
-                                callback_data=f"approve_line_{request_id}",
-                            ),
-                            InlineKeyboardButton(
-                                text="❌ Decline",
-                                callback_data=f"decline_line_{request_id}",
-                            ),
-                        ]
-                    ]
-                )
+            if not record:
+                await callback.message.answer("❌ No lines available right now.")
+                await callback.answer()
+                return
 
-                try:
-                    await self.bot.send_message(
-                        chat_id=self.admin_id, text=text, parse_mode="HTML", reply_markup=kb
-                    )
-                except Exception as e:
-                    logging.error(f"Error sending to master admin: {e}")
-
-                admins = self.get_all_admins()
-                for adm in admins:
-                    if adm["user_id"] == self.admin_id:
-                        continue
-                    try:
-                        await self.bot.send_message(
-                            chat_id=adm["user_id"],
-                            text=text,
-                            parse_mode="HTML",
-                            reply_markup=kb,
-                        )
-                    except Exception as e:
-                        logging.error(f"Error sending to admin {adm['user_id']}: {e}")
-
-            user_mention = callback.from_user.mention_html()
-            await send_request_to_all_admins(request_id, user_mention, username)
-
-            await callback.message.answer(
-                "✅ Request sent to admins!\n\n⏳ Waiting for approval...",
-                parse_mode="HTML",
+            # fetch agent info
+            user_info = await loop.run_in_executor(
+                None, self.get_user_info, user_id
             )
+            agent_name = (
+                user_info["agent_name"]
+                if user_info and user_info.get("agent_name")
+                else "Agent"
+            )
+            reference = user_info["reference"] if user_info else self.reference
+
+            # build DM text similar to approve_line success
+            dm = ""
+            dm += f"👤 <b>Agent:</b> {agent_name}\n"
+            dm += f"🗃️ Reference: <code>{reference}</code>\n\n"
+            dm += "🎫 <b>Your Line:</b>\n\n"
+            if record.get("name"):
+                dm += f"👤 Name: {record['name']}\n"
+            if record.get("address"):
+                dm += f"📍 Address: {record['address']}\n"
+            if record.get("email"):
+                dm += f"✉️ Email: {record['email']}\n"
+            dm += f"📞 Number: <code>{record['number']}</code>\n\n"
+            dm += "✅ Please call this number now and then submit the call result."
+
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id, text=dm, parse_mode="HTML"
+                )
+                await callback.message.answer("✅ Line assigned! Check your DM.")
+            except TelegramForbiddenError:
+                await callback.message.answer(
+                    "⚠️ Please start the bot in private first, then click /start again."
+                )
+
             await callback.answer()
 
         @r.callback_query(F.data.startswith("approve_line_"))
