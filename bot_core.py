@@ -995,26 +995,52 @@ class LineBot:
 
         @r.message(UserStates.waiting_for_summary, F.text)
         async def receive_need_pass_summary(message: Message, state: FSMContext):
-            if message.text.startswith("/cancel"):
+            data = await state.get_data()
+            user_id = data.get('user_id')
+            need_pass = data.get('need_pass', False)
+            summary_text = message.text
+
+            loop = asyncio.get_event_loop()
+            if message.text.startswith('/cancel'):
                 await state.clear()
                 await message.answer("❌ Cancelled.")
+                await loop.run_in_executor(None, self.update_record_summary, user_id, summary_text)
+                await loop.run_in_executor(None, self.mark_line_completed, user_id)
                 return
 
-            summary = message.text.strip()
-            if not summary:
-                await message.answer("❌ Summary cannot be empty.")
-                return
+            await loop.run_in_executor(None, self.update_record_summary, user_id, summary_text)
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
 
-            user_id = message.from_user.id
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary
-            )
+            username = message.from_user.username or message.from_user.first_name
+            user_mention = message.from_user.mention_html()
 
-            await message.answer(
-                "✅ Pass noted.\n\nYou can continue your call with this info.",
-                parse_mode="HTML",
-            )
+            # Send summary to group
+            try:
+                await self.bot.send_message(
+                    chat_id=self.group_chat_id,
+                    text=f"📋 <b>Summary from {user_mention}</b>\n\n{summary_text}",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.error(f"Error: {e}")
+
+            if need_pass:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Request New Line 🔄", callback_data=f"request_new_line_{user_id}")]
+                ])
+
+                await message.answer(
+                    "✅ <b>Summary submitted!</b>\n\nClick below to request a new line:",
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            else:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_new_line_{user_id}")]
+                ])
+
+                await message.answer("✅ <b>Summary submitted!</b>", parse_mode="HTML", reply_markup=keyboard)
+
             await state.clear()
 
         @r.callback_query(F.data.startswith("finishing_"))
@@ -1051,35 +1077,53 @@ class LineBot:
                 await message.answer("❌ Cancelled.")
                 return
 
-            summary = message.text.strip()
-            if not summary:
+            data = await state.get_data()
+            user_id = data.get("user_id")
+            summary_text = message.text.strip()
+
+            if not summary_text:
                 await message.answer("❌ Summary cannot be empty.")
                 return
 
-            user_id = message.from_user.id
             loop = asyncio.get_event_loop()
+            # Save summary + mark completed
             await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary
+                None, self.update_record_summary, user_id, summary_text
             )
             await loop.run_in_executor(None, self.mark_line_completed, user_id)
 
+            # Send summary to group (like old bot)
+            try:
+                user_mention = message.from_user.mention_html()
+                await self.bot.send_message(
+                    chat_id=self.group_chat_id,
+                    text=(
+                        f"🫡 <b>{user_mention} finishing call</b>\n\n"
+                        f"📝 <b>Summary:</b>\n{summary_text}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.error(f"Error sending finishing summary to group: {e}")
+
+            # Button to request another line
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Request Another Line 🔄",
-                            callback_data="request_line",
+                            text="Request New Line 🔄", callback_data="request_line"
                         )
                     ]
                 ]
             )
 
             await message.answer(
-                "✅ Summary saved and line marked as finished.\n\n"
-                "You can request another line.",
-                reply_markup=kb,
+                "✅ <b>Finishing summary sent to group!</b>\n\n"
+                "You can now request a new line if needed.",
                 parse_mode="HTML",
+                reply_markup=kb,
             )
+
             await state.clear()
 
         @r.callback_query(F.data.startswith("vic_callback_"))
@@ -1111,41 +1155,59 @@ class LineBot:
 
         @r.message(UserStates.waiting_for_callback_summary, F.text)
         async def receive_callback_summary(message: Message, state: FSMContext):
+            data = await state.get_data()
+            user_id = data.get("user_id")
+            summary_text = message.text.strip()
+
+            loop = asyncio.get_event_loop()
             if message.text.startswith("/cancel"):
                 await state.clear()
                 await message.answer("❌ Cancelled.")
+                # Old bot also marked line completed on cancel
+                await loop.run_in_executor(None, self.mark_line_completed, user_id)
                 return
 
-            summary = message.text.strip()
-            if not summary:
+            if not summary_text:
                 await message.answer("❌ Summary cannot be empty.")
                 return
 
-            user_id = message.from_user.id
-            loop = asyncio.get_event_loop()
+            # Save summary + mark completed (line free for new call)
             await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary
+                None, self.update_record_summary, user_id, summary_text
             )
-            # Typically line is done for this agent; mark completed
             await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            # Send summary to group (like old bot)
+            try:
+                user_mention = message.from_user.mention_html()
+                await self.bot.send_message(
+                    chat_id=self.group_chat_id,
+                    text=(
+                        f"☎️ <b>{user_mention} needs callback</b>\n\n"
+                        f"📝 <b>Summary:</b>\n{summary_text}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.error(f"Error sending callback summary to group: {e}")
 
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Request Another Line 🔄",
-                            callback_data="request_line",
+                            text="Request New Line 🔄", callback_data="request_line"
                         )
                     ]
                 ]
             )
 
             await message.answer(
-                "✅ Callback note saved and line marked as completed.\n\n"
-                "You can request another line.",
-                reply_markup=kb,
+                "✅ <b>Callback summary sent to group!</b>\n\n"
+                "You can now request a new line if needed.",
                 parse_mode="HTML",
+                reply_markup=kb,
             )
+
             await state.clear()
 
         @r.callback_query(F.data.startswith("call_ended_"))
@@ -1177,42 +1239,59 @@ class LineBot:
 
         @r.message(UserStates.waiting_for_call_ended_summary, F.text)
         async def receive_call_ended_summary(message: Message, state: FSMContext):
+            data = await state.get_data()
+            user_id = data.get("user_id")
+            summary_text = message.text.strip()
+
+            loop = asyncio.get_event_loop()
             if message.text.startswith("/cancel"):
                 await state.clear()
                 await message.answer("❌ Cancelled.")
+                await loop.run_in_executor(None, self.mark_line_completed, user_id)
                 return
 
-            summary = message.text.strip()
-            if not summary:
+            if not summary_text:
                 await message.answer("❌ Summary cannot be empty.")
                 return
 
-            user_id = message.from_user.id
-            loop = asyncio.get_event_loop()
+            # Save summary + mark completed
             await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary
+                None, self.update_record_summary, user_id, summary_text
             )
             await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            # Send final call summary to group (like old bot)
+            try:
+                user_mention = message.from_user.mention_html()
+                await self.bot.send_message(
+                    chat_id=self.group_chat_id,
+                    text=(
+                        f"📝 <b>{user_mention}'s Call Summary:</b>\n\n"
+                        f"{summary_text}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.error(f"Error sending call-ended summary to group: {e}")
 
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Request Another Line 🔄",
-                            callback_data="request_line",
+                            text="Request New Line 🔄", callback_data="request_line"
                         )
                     ]
                 ]
             )
 
             await message.answer(
-                "✅ Call summary saved and line marked as completed.\n\n"
-                "You can request another line.",
-                reply_markup=kb,
+                "✅ <b>Summary sent to group!</b>\n\n"
+                "You can now request a new line if needed.",
                 parse_mode="HTML",
+                reply_markup=kb,
             )
-            await state.clear()
 
+            await state.clear()
 
         @r.callback_query(F.data.startswith("noanswer_"))
         async def callback_noanswer(callback: CallbackQuery):
