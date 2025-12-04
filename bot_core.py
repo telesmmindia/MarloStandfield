@@ -746,7 +746,6 @@ class LineBot:
             user_id = callback.from_user.id
             username = callback.from_user.username or callback.from_user.first_name
 
-            # group membership check (keep as-is)
             try:
                 member = await self.bot.get_chat_member(self.group_chat_id, user_id)
                 if member.status == "kicked":
@@ -762,10 +761,11 @@ class LineBot:
                 await callback.answer()
                 return
 
-            # bot running check (keep)
             status = self.get_bot_status()
             if status == "stopped":
-                await callback.message.answer("⏸️ Bot is currently stopped.", parse_mode="HTML")
+                await callback.message.answer(
+                    "⏸️ Bot is currently stopped.", parse_mode="HTML"
+                )
                 await callback.answer()
                 return
 
@@ -828,179 +828,30 @@ class LineBot:
             dm += f"📞 Number: <code>{record['number']}</code>\n\n"
             dm += "✅ Please call this number now and then submit the call result."
 
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="OTP 📞", callback_data=f"otp_{user_id}"
+                        ),
+                        InlineKeyboardButton(
+                            text="No Answer ❌",
+                            callback_data=f"noanswer_{user_id}",
+                        ),
+                    ]
+                ]
+            )
+
             try:
                 await self.bot.send_message(
-                    chat_id=user_id, text=dm, parse_mode="HTML"
+                    chat_id=user_id, text=dm, reply_markup=kb, parse_mode="HTML"
                 )
-                await callback.message.answer("✅ Line assigned! Check your DM.")
             except TelegramForbiddenError:
                 await callback.message.answer(
                     "⚠️ Please start the bot in private first, then click /start again."
                 )
 
             await callback.answer()
-
-        @r.callback_query(F.data.startswith("approve_line_"))
-        async def callback_approve_line(callback: CallbackQuery):
-            loop = asyncio.get_event_loop()
-
-            if not await loop.run_in_executor(
-                None, self.is_admin, callback.from_user.id
-            ):
-                await callback.answer("❌ Admin only!", show_alert=True)
-                return
-
-            request_id = int(callback.data.split("_")[2])
-
-            def get_request_by_id(req_id: int):
-                with self.get_db_connection() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(
-                            "SELECT * FROM number_requests WHERE id = %s", (req_id,)
-                        )
-                        return cursor.fetchone()
-
-            request = await loop.run_in_executor(None, get_request_by_id, request_id)
-            if not request:
-                await callback.answer("❌ Not found or already processed!", show_alert=True)
-                try:
-                    await callback.message.delete()
-                except Exception:
-                    pass
-                return
-
-            if request["status"] != "pending":
-                await callback.answer(
-                    f"⚠️ Already {request['status']}!", show_alert=True
-                )
-                try:
-                    await callback.message.delete()
-                except Exception:
-                    pass
-                return
-
-            user_id = request["user_id"]
-            username = request["username"]
-
-            def update_request_and_assign():
-                with self.get_db_connection() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(
-                            """
-                            UPDATE number_requests
-                            SET status = 'approved', processed_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (request_id,),
-                        )
-                        cursor.execute(
-                            """
-                            SELECT id, number, name, address, email
-                            FROM number_queue
-                            WHERE is_used = FALSE AND is_completed = FALSE
-                            ORDER BY id LIMIT 1
-                            """
-                        )
-                        rec = cursor.fetchone()
-                        if not rec:
-                            return None
-                        cursor.execute(
-                            """
-                            UPDATE number_queue
-                            SET is_used = TRUE,
-                                used_by_user_id = %s,
-                                used_by_username = %s,
-                                used_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (user_id, username, rec["id"]),
-                        )
-                        cursor.execute(
-                            "DELETE FROM number_requests WHERE id = %s", (request_id,)
-                        )
-                        return rec
-
-            record = await loop.run_in_executor(None, update_request_and_assign)
-
-            if record:
-                user_info = await loop.run_in_executor(
-                    None, self.get_user_info, user_id
-                )
-                agent_name = (
-                    user_info["agent_name"]
-                    if user_info and user_info.get("agent_name")
-                    else "Agent"
-                )
-                reference = (
-                    user_info["reference"] if user_info else self.reference
-                )
-
-                dm = ""
-                dm += f"👤 <b>Agent:</b> {agent_name}\n"
-                dm += f"🗃️ Reference: <code>{reference}</code>\n\n"
-                dm += "🎫 <b>Your Line:</b>\n\n"
-                if record.get("name"):
-                    dm += f"👤 Name: {record['name']}\n"
-                dm += f"📞 Number: <code>{record['number']}</code>\n"
-                if record.get("address"):
-                    dm += f"📍 Address: {record['address']}\n"
-                if record.get("email"):
-                    dm += f"📧 Email: {record['email']}\n"
-
-                kb = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="OTP 📞", callback_data=f"otp_{user_id}"
-                            ),
-                            InlineKeyboardButton(
-                                text="No Answer ❌",
-                                callback_data=f"noanswer_{user_id}",
-                            ),
-                        ]
-                    ]
-                )
-
-                try:
-                    await self.bot.send_message(
-                        chat_id=user_id,
-                        text=dm,
-                        parse_mode="HTML",
-                        reply_markup=kb,
-                    )
-
-                    user_mention = (
-                        f"@{username}" if username else f"User {user_id}"
-                    )
-                    await self.bot.send_message(
-                        chat_id=self.group_chat_id,
-                        text=f"✅ {user_mention} line has been sent in private",
-                        parse_mode="HTML",
-                    )
-                except TelegramForbiddenError:
-                    await self.bot.send_message(
-                        chat_id=self.admin_id,
-                        text=(
-                            f"⚠️ Can't send DM to {username or user_id}. "
-                            "They need to start the bot first."
-                        ),
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logging.error(f"Error sending line: {e}")
-            else:
-                await self.bot.send_message(
-                    chat_id=self.admin_id,
-                    text="❌ No numbers available in queue",
-                    parse_mode="HTML",
-                )
-
-            try:
-                await callback.message.delete()
-            except Exception:
-                pass
-
-            await callback.answer("✅ Line approved and sent!")
 
         @r.callback_query(F.data.startswith("otp_"))
         async def callback_otp(callback: CallbackQuery):
