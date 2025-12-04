@@ -1423,29 +1423,6 @@ async def cmd_export_no_answer(message: Message):
     else:
         await message.answer("No 'No Answer' records found.")
 
-def check_can_request_new_line(user_id):
-    """Check if user can request a NEW line"""
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            # Check if user has ACTIVE line (not completed)
-            cursor.execute(
-                "SELECT id FROM number_queue WHERE used_by_user_id = %s AND is_used = TRUE AND is_completed = FALSE",
-                (user_id,)
-            )
-            if cursor.fetchone():
-                return False, "already_has_line"
-
-            # Check for pending requests
-            cursor.execute(
-                "SELECT id FROM number_requests WHERE user_id = %s AND status IN ('pending', 'approved')",
-                (user_id,)
-            )
-            if cursor.fetchone():
-                return False, "pending_request"
-
-            return True, "ok"
-
-
 async def send_request_to_all_admins(bot: Bot, request_id: int, user_mention: str, username: str):
     """Send line request to all admins"""
     loop = asyncio.get_event_loop()
@@ -2222,45 +2199,6 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
     await callback.answer()
 
 
-
-# REQUEST NEW LINE CALLBACK
-@router.callback_query(F.data.startswith("request_new_line_"))
-async def callback_request_new_line(callback: CallbackQuery, bot: Bot):
-    user_id = int(callback.data.split("_")[3])
-
-    if callback.from_user.id != user_id:
-        await callback.answer("Not for you!", show_alert=True)
-        return
-
-    username = callback.from_user.username or callback.from_user.first_name
-    user_mention = callback.from_user.mention_html()
-
-    loop = asyncio.get_event_loop()
-    request_id = await loop.run_in_executor(None, create_line_request, user_id, username)
-
-    admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_line_{request_id}"),
-            InlineKeyboardButton(text="❌ Decline", callback_data=f"decline_line_{request_id}")
-        ]
-    ])
-
-
-    user_mention = callback.from_user.mention_html()
-    await send_request_to_all_admins(bot, request_id, user_mention, username)
-    try:
-        await bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=f"📝 {user_mention} requested another line",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.error(f"Error: {e}")
-
-    await callback.message.edit_text(f"{callback.message.text}\n\n⏳ Request sent!", parse_mode="HTML")
-    await callback.answer()
-
-
 # SUMMARY CALLBACK
 @router.callback_query(F.data.startswith("summary_"))
 async def callback_summary(callback: CallbackQuery, state: FSMContext):
@@ -2318,7 +2256,7 @@ async def receive_summary(message: Message, state: FSMContext, bot: Bot):
 
     if need_pass:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Request New Line 🔄", callback_data=f"request_new_line_{user_id}")]
+            [InlineKeyboardButton(text="Request New Line 🔄", callback_data=f"request_line")]
         ])
 
         await message.answer(
@@ -2328,7 +2266,7 @@ async def receive_summary(message: Message, state: FSMContext, bot: Bot):
         )
     else:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_new_line_{user_id}")]
+            [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_line")]
         ])
 
         await message.answer("✅ <b>Summary submitted!</b>", parse_mode="HTML", reply_markup=keyboard)
