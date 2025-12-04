@@ -1,4 +1,6 @@
 import asyncio
+import traceback
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -940,7 +942,9 @@ async def cmd_start(message: Message, state: FSMContext):
                 )
         else:
             try:
+                print(message.from_user)
                 member = await message.bot.get_chat_member(GROUP_CHAT_ID, message.from_user.id)
+                print(member.status)
                 if member.status == "kicked":
                     await message.answer("⚠️ You're blocked from the group!")
                     return
@@ -948,6 +952,7 @@ async def cmd_start(message: Message, state: FSMContext):
                     await message.answer("⚠️ You must be a member of the group!")
                     return
             except Exception as e:
+                print(traceback.format_exc())
                 await message.answer("⚠️ You must be a member of the group!")
                 return
 

@@ -823,10 +823,10 @@ class LineBot:
                     with conn.cursor() as cursor:
                         cursor.execute(
                             """
-                            INSERT INTO number_requests (user_id, username, status, requested_at, group_chat_id)
-                            VALUES (%s, %s, 'pending', NOW(), %s)
+                            INSERT INTO number_requests (user_id, username, status, requested_at)
+                            VALUES (%s, %s, 'pending', NOW())
                             """,
-                            (uid, uname, self.group_chat_id),
+                            (uid, uname),
                         )
                         cursor.execute("SELECT LAST_INSERT_ID() AS id")
                         return cursor.fetchone()["id"]
