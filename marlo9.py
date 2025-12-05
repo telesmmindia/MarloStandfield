@@ -19,9 +19,9 @@ import csv
 logging.basicConfig(level=logging.INFO)
 
 # Configuration
-BOT_TOKEN = "8398256598:AAFgBbTDVmGXyIj68CqECHOlrV0le1iLTnc"
+BOT_TOKEN = "8201485999:AAET5O4XfPvmosLLriWRVsQrjtIHvAYDMC4"
 ADMIN_ID = 8299470786
-GROUP_CHAT_ID = -5057446614;
+GROUP_CHAT_ID = -4991822556;
 REFERENCE = 'LG206187'
 
 
@@ -30,7 +30,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
     'password': '3kkxb7jdfh',
-    'database': 'marlo_claimlines',
+    'database': 'marlo_ask4lines',
     'charset': 'utf8mb4',
     'cursorclass': DictCursor
 }
