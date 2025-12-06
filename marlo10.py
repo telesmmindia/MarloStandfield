@@ -1752,9 +1752,10 @@ async def callback_otp(callback: CallbackQuery, bot: Bot):
     agent_name = user_info['agent_name'] if user_info and user_info.get('agent_name') else "Agent"
     reference = user_info['reference'] if user_info else "LG206187"
 
-    # FOUR OPTIONS
+    # FIVE OPTIONS (added email)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Need a Pass ⛹️", callback_data=f"need_pass_{user_id}")],
+        [InlineKeyboardButton(text="Needs an email 📧", callback_data=f"need_email_{user_id}")],
         [InlineKeyboardButton(text="Finishing 🫡", callback_data=f"finishing_{user_id}")],
         [InlineKeyboardButton(text="Vic Needs Callback ☎️", callback_data=f"vic_callback_{user_id}")],
         [InlineKeyboardButton(text="Call Ended 📵", callback_data=f"call_ended_{user_id}")]
@@ -2129,6 +2130,40 @@ async def callback_need_pass(callback: CallbackQuery, state: FSMContext, bot: Bo
 
     await callback.answer()
 
+# NEEDS EMAIL CALLBACK
+@router.callback_query(F.data.startswith("need_email_"))
+async def callback_need_email(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    user_id = int(callback.data.split("_")[2])
+
+    if callback.from_user.id != user_id:
+        await callback.answer("Not for you!", show_alert=True)
+        return
+
+    username = callback.from_user.username or callback.from_user.first_name
+    user_mention = callback.from_user.mention_html()
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, update_record_status, user_id, "Need Email")
+
+    try:
+        await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"📧 <b>User needs email sent</b>\n\n{user_mention}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Error: {e}")
+
+    # Ask for summary (same as need_pass)
+    await state.set_state(UserStates.waiting_for_summary)
+    await state.update_data(user_id=user_id, need_pass=False)  # need_pass=False for email
+
+    await callback.message.answer(
+        "📝 <b>Enter your summary before requesting another email:</b>\n\nSend /cancel to abort.",
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("noanswer_"))
 async def callback_noanswer(callback: CallbackQuery, bot: Bot):
@@ -2143,21 +2178,18 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
     # STEP 1: Update status
     await loop.run_in_executor(None, update_record_status, user_id, "No Answer")
 
-    # STEP 2: CRITICAL - Mark line as completed IMMEDIATELY
-    await loop.run_in_executor(None, mark_line_completed, user_id)
+    # STEP 2: Get record BEFORE marking completed ✅
+    record = await loop.run_in_executor(None, get_user_record, user_id)
 
     username = callback.from_user.username or callback.from_user.first_name
     user_mention = callback.from_user.mention_html()
 
-    # Get user's current line details BEFORE marking complete
-    record = await loop.run_in_executor(None, get_user_record, user_id)
-
-    # Get user agent name and reference
+    # STEP 3: Get user agent name and reference
     user_info = await loop.run_in_executor(None, get_user_info, user_id)
     agent_name = user_info['agent_name'] if user_info and user_info.get('agent_name') else "Agent"
     reference = user_info['reference'] if user_info else REFERENCE
 
-    # Save no answer record
+    # STEP 4: Save no answer record (while we still have the data)
     if record:
         await loop.run_in_executor(
             None,
@@ -2172,8 +2204,21 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
             record.get('email')
         )
 
+    # STEP 5: NOW mark line as completed ✅
+    await loop.run_in_executor(None, mark_line_completed, user_id)
+
+    # STEP 6: Notify group
+    try:
+        await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=f"❌ {user_mention} - No Answer",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Error: {e}")
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_line")]
+        [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
     ])
 
     await callback.message.edit_text(
@@ -2183,6 +2228,7 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
     )
 
     await callback.answer()
+
 
 
 # SUMMARY CALLBACK

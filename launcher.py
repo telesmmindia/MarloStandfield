@@ -4,7 +4,10 @@ import logging
 from pathlib import Path
 from bot_core import LineBot
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 
 async def run_bot(config_path: str):
@@ -12,23 +15,32 @@ async def run_bot(config_path: str):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    bot = LineBot(config)
-    await bot.start()
+    bot_instance = LineBot(config)
+    await bot_instance.start()
 
 
 async def main():
     """Run all bots in parallel"""
     config_dir = Path("configs")
+
+    if not config_dir.exists():
+        logging.error("❌ configs/ folder not found!")
+        return
+
     config_files = list(config_dir.glob("*.json"))
 
     if not config_files:
         logging.error("❌ No config files found in configs/")
         return
 
-    logging.info(f"🚀 Starting {len(config_files)} bots...")
+    logging.info(f"🚀 Starting {len(config_files)} bot(s)...")
 
-    tasks = [run_bot(str(config_file)) for config_file in config_files]
-    await asyncio.gather(*tasks)
+    for cf in config_files:
+        logging.info(f"   📄 Found: {cf.name}")
+
+    # Run all bots in parallel
+    tasks = [run_bot(str(cf)) for cf in config_files]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == '__main__':

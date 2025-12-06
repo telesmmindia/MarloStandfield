@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import io
+import csv
 from contextlib import contextmanager
 from typing import Dict, Any, Optional, List
 
@@ -20,14 +22,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BotCommand,
-)
-import io
-import csv
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    BotCommandScopeChat,
+    BufferedInputFile,
 )
 
 
@@ -47,24 +43,14 @@ class UserStates(StatesGroup):
 
 
 class LineBot:
-    """
-    One reusable bot instance.
-
-    Per-bot config fields:
-      - bot_token
-      - admin_id
-      - group_chat_id
-      - reference
-      - database: {host, user, password, database, charset}
-    """
+    """Reusable bot instance with separate config"""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-
         self.bot_token: str = config["bot_token"]
         self.admin_id: int = config["admin_id"]
         self.group_chat_id: int = config["group_chat_id"]
-        self.reference: str = config.get("reference", "CB2061")
+        self.reference: str = config.get("reference", "REF001")
 
         db_cfg = config["database"]
         self.db_config = {
@@ -81,9 +67,9 @@ class LineBot:
         self.router: Router = Router()
 
         self._register_handlers()
-        logging.info(f"✅ LineBot created for reference {self.reference}")
+        logging.info(f"✅ LineBot initialized: {self.reference}")
 
-    # ============= DB CONNECTION =============
+    # ==================== DATABASE ====================
 
     @contextmanager
     def get_db_connection(self):
@@ -93,27 +79,21 @@ class LineBot:
             conn.commit()
         except Exception as e:
             conn.rollback()
-            logging.error(f"Database error: {e}")
+            logging.error(f"[{self.reference}] DB error: {e}")
             raise
         finally:
             conn.close()
 
-    # ============= DB INIT =============
-
     def init_database(self):
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS bot_status (
-                       id INT PRIMARY KEY DEFAULT 1,
-                       status VARCHAR(50) DEFAULT 'running'
+                        id INT PRIMARY KEY DEFAULT 1,
+                        status VARCHAR(50) DEFAULT 'running'
                     )
-                    """
-                )
-
-                cursor.execute(
-                    """
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS no_answer_records (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         user_id BIGINT NOT NULL,
@@ -125,14 +105,10 @@ class LineBot:
                         address TEXT,
                         email VARCHAR(255),
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        INDEX idx_user_id (user_id),
-                        INDEX idx_created_at (created_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    """
-                )
-
-                cursor.execute(
-                    f"""
+                        INDEX idx_user_id (user_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cursor.execute(f"""
                     CREATE TABLE IF NOT EXISTS users (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         user_id BIGINT NOT NULL UNIQUE,
@@ -140,12 +116,9 @@ class LineBot:
                         reference VARCHAR(50) DEFAULT '{self.reference}',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         INDEX idx_user_id (user_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    """
-                )
-
-                cursor.execute(
-                    """
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS number_queue (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         number VARCHAR(255) NOT NULL,
@@ -161,72 +134,115 @@ class LineBot:
                         status VARCHAR(50) DEFAULT NULL,
                         call_summary TEXT DEFAULT NULL,
                         summary_submitted_at TIMESTAMP NULL DEFAULT NULL,
-                        group_chat_id BIGINT DEFAULT NULL,
                         INDEX idx_is_used (is_used),
-                        INDEX idx_is_completed (is_completed),
-                        INDEX idx_added_at (added_at),
-                        INDEX idx_user_id (used_by_user_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    """
-                )
-
-                cursor.execute(
-                    """
+                        INDEX idx_is_completed (is_completed)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS number_requests (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         user_id BIGINT NOT NULL,
                         username VARCHAR(255) DEFAULT NULL,
-                        group_chat_id BIGINT NOT NULL,
-                        previous_number VARCHAR(255) DEFAULT NULL,
-                        reason VARCHAR(100) DEFAULT NULL,
+                        group_chat_id BIGINT DEFAULT NULL,
                         status VARCHAR(50) DEFAULT 'pending',
                         requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         processed_at TIMESTAMP NULL DEFAULT NULL,
-                        INDEX idx_status (status),
-                        INDEX idx_user_id (user_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    """
-                )
-
-                cursor.execute(
-                    """
+                        INDEX idx_status (status)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS admins (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         user_id BIGINT NOT NULL UNIQUE,
                         username VARCHAR(255),
                         added_by BIGINT NOT NULL,
-                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        INDEX idx_user_id (user_id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    """
-                )
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+        logging.info(f"[{self.reference}] Database initialized")
 
-                logging.info(
-                    f"✅ Database tables initialized for reference {self.reference}"
-                )
+    # ==================== DB HELPERS ====================
 
-    # ============= DB HELPERS =============
+    def get_bot_status(self) -> str:
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT status FROM bot_status WHERE id = 1")
+                row = cursor.fetchone()
+                return row["status"] if row else "running"
+
+    def set_bot_status(self, status: str):
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO bot_status (id, status) VALUES (1, %s) ON DUPLICATE KEY UPDATE status = %s",
+                    (status, status)
+                )
 
     def save_agent_name(self, user_id: int, agent_name: str):
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    f"""
-                    INSERT INTO users (user_id, agent_name, reference)
-                    VALUES (%s, %s, '{self.reference}')
-                    ON DUPLICATE KEY UPDATE agent_name = %s
-                    """,
-                    (user_id, agent_name, agent_name),
+                    f"""INSERT INTO users (user_id, agent_name, reference) 
+                        VALUES (%s, %s, '{self.reference}') 
+                        ON DUPLICATE KEY UPDATE agent_name = %s""",
+                    (user_id, agent_name, agent_name)
                 )
 
-    def get_user_info(self, user_id: int) -> Optional[Dict[str, Any]]:
+    def get_user_info(self, user_id: int) -> Optional[Dict]:
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT agent_name, reference FROM users WHERE user_id = %s", (user_id,))
+                return cursor.fetchone()
+
+    def get_user_record(self, user_id: int) -> Optional[Dict]:
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT agent_name, reference FROM users WHERE user_id = %s",
-                    (user_id,),
+                    """SELECT * FROM number_queue
+                       WHERE used_by_user_id = %s AND is_used = TRUE AND is_completed = FALSE
+                       ORDER BY used_at DESC, id DESC LIMIT 1""",
+                    (user_id,)
                 )
                 return cursor.fetchone()
+
+    def mark_line_completed(self, user_id: int):
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE number_queue SET is_completed = TRUE WHERE used_by_user_id = %s AND is_used = TRUE",
+                    (user_id,)
+                )
+                cursor.execute(
+                    "DELETE FROM number_requests WHERE user_id = %s AND status IN ('pending', 'approved')",
+                    (user_id,)
+                )
+
+    def update_record_status(self, user_id: int, status: str):
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE number_queue SET status = %s WHERE used_by_user_id = %s AND is_used = TRUE AND is_completed = FALSE",
+                    (status, user_id)
+                )
+
+    def update_record_summary(self, user_id: int, summary: str):
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """UPDATE number_queue SET call_summary = %s, summary_submitted_at = NOW() 
+                       WHERE used_by_user_id = %s AND is_used = TRUE AND is_completed = FALSE""",
+                    (summary, user_id)
+                )
+
+    def save_no_answer_record(self, user_id, username, agent_name, reference, number, name, address, email):
+        with self.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO no_answer_records 
+                       (user_id, username, agent_name, reference, number, name, address, email) 
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (user_id, username, agent_name, reference, number, name, address, email)
+                )
 
     def is_admin(self, user_id: int) -> bool:
         if user_id == self.admin_id:
@@ -236,190 +252,55 @@ class LineBot:
                 cursor.execute("SELECT id FROM admins WHERE user_id = %s", (user_id,))
                 return cursor.fetchone() is not None
 
-    def get_all_admins(self) -> List[Dict[str, Any]]:
+    def get_all_admins(self) -> List[Dict]:
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT user_id, username, added_at FROM admins ORDER BY added_at"
-                )
+                cursor.execute("SELECT user_id, username, added_at FROM admins ORDER BY added_at")
                 return cursor.fetchall()
 
-    def get_user_record(self, user_id: int) -> Optional[Dict[str, Any]]:
+    def add_admin(self, user_id: int, username: str, added_by: int):
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """
-                    SELECT * FROM number_queue
-                    WHERE used_by_user_id = %s
-                      AND is_used = TRUE
-                      AND is_completed = FALSE
-                    ORDER BY used_at DESC, id DESC
-                    LIMIT 1
-                    """,
-                    (user_id,),
+                    "INSERT INTO admins (user_id, username, added_by) VALUES (%s, %s, %s)",
+                    (user_id, username, added_by)
                 )
-                row = cursor.fetchone()
-                return row if row else None
 
-    def mark_line_completed(self, user_id: int):
+    def remove_admin(self, user_id: int) -> int:
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE number_queue SET is_completed = TRUE "
-                    "WHERE used_by_user_id = %s AND is_used = TRUE",
-                    (user_id,),
-                )
-                cursor.execute(
-                    "DELETE FROM number_requests "
-                    "WHERE user_id = %s AND status IN ('pending','approved')",
-                    (user_id,),
-                )
+                cursor.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+                return cursor.rowcount
 
-    def get_next_number(
-        self, user_id: int, username: Optional[str] = None, force_new: bool = False
-    ) -> Optional[Dict[str, Any]]:
+    def get_queue_stats(self):
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                if not force_new:
-                    cursor.execute(
-                        """
-                        SELECT number FROM number_queue
-                        WHERE used_by_user_id = %s
-                          AND is_used = TRUE
-                          AND is_completed = FALSE
-                        LIMIT 1
-                        """,
-                        (user_id,),
-                    )
-                    existing = cursor.fetchone()
-                    if existing:
-                        return None
+                cursor.execute("SELECT COUNT(*) as c FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE")
+                remaining = cursor.fetchone()["c"]
+                cursor.execute("SELECT COUNT(*) as c FROM number_queue WHERE is_used = TRUE")
+                used = cursor.fetchone()["c"]
+                return remaining, used
 
-                cursor.execute(
-                    """
-                    SELECT id, number, name, address, email
-                    FROM number_queue
-                    WHERE is_used = FALSE AND is_completed = FALSE
-                    ORDER BY id
-                    LIMIT 1
-                    """
-                )
-                result = cursor.fetchone()
-                if not result:
-                    return None
-
-                record_id = result["id"]
-                cursor.execute(
-                    """
-                    UPDATE number_queue
-                    SET is_used = TRUE,
-                        used_by_user_id = %s,
-                        used_by_username = %s,
-                        used_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (user_id, username, record_id),
-                )
-                return result
-
-    def update_record_status(self, user_id: int, status: str):
+    def add_numbers_to_queue(self, numbers: List[str]):
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE number_queue SET status = %s WHERE used_by_user_id = %s",
-                    (status, user_id),
-                )
+                cursor.executemany("INSERT INTO number_queue (number) VALUES (%s)", [(n.strip(),) for n in numbers])
 
-    def save_no_answer_record(
-        self,
-        user_id: int,
-        username: str,
-        agent_name: str,
-        reference: str,
-        number: str,
-        name: Optional[str],
-        address: Optional[str],
-        email: Optional[str],
-    ):
+    def add_records_from_csv(self, records: List[tuple]):
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO no_answer_records
-                      (user_id, username, agent_name, reference, number, name, address, email)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        user_id,
-                        username,
-                        agent_name,
-                        reference,
-                        number,
-                        name,
-                        address,
-                        email,
-                    ),
+                cursor.executemany(
+                    "INSERT INTO number_queue (number, name, address, email) VALUES (%s, %s, %s, %s)",
+                    records
                 )
-
-    def set_bot_status(self, status: str):
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO bot_status (id, status)
-                    VALUES (1, %s)
-                    ON DUPLICATE KEY UPDATE status = %s
-                    """,
-                    (status, status),
-                )
-
-    def get_bot_status(self) -> str:
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT status FROM bot_status WHERE id = 1")
-                row = cursor.fetchone()
-                return row["status"] if row else "running"
 
     def reset_queue(self) -> int:
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """
-                    UPDATE number_queue
-                       SET is_used = FALSE,
-                           used_by_user_id = NULL,
-                           used_by_username = NULL,
-                           used_at = NULL,
-                           status = NULL,
-                           call_summary = NULL,
-                           summary_submitted_at = NULL
-                     WHERE is_completed = FALSE
-                    """
-                )
-                return cursor.rowcount
-
-    # ============= MORE DB HELPERS =============
-
-    def get_queue_stats(self):
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT COUNT(*) as count FROM number_queue WHERE is_used = FALSE"
-                )
-                remaining = cursor.fetchone()["count"]
-
-                cursor.execute(
-                    "SELECT COUNT(*) as count FROM number_queue WHERE is_used = TRUE"
-                )
-                used = cursor.fetchone()["count"]
-
-                return remaining, used
-
-    def clear_pending_requests(self) -> int:
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "DELETE FROM number_requests WHERE status IN ('pending','approved')"
+                    """UPDATE number_queue SET is_used = FALSE, used_by_user_id = NULL, 
+                       used_by_username = NULL, used_at = NULL, status = NULL, call_summary = NULL
+                       WHERE is_completed = FALSE"""
                 )
                 return cursor.rowcount
 
@@ -430,222 +311,114 @@ class LineBot:
                 cursor.execute("DELETE FROM number_requests")
                 return cursor.rowcount
 
-    def add_numbers_to_queue(self, numbers_list: List[str]):
+    def clear_pending_requests(self) -> int:
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
-                query = "INSERT INTO number_queue (number) VALUES (%s)"
-                cursor.executemany(query, [(num.strip(),) for num in numbers_list])
-
-    def add_records_from_csv(self, records_list: List[tuple]):
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                query = """INSERT INTO number_queue (number, name, address, email) 
-                           VALUES (%s, %s, %s, %s)"""
-                cursor.executemany(query, records_list)
+                cursor.execute("DELETE FROM number_requests WHERE status IN ('pending', 'approved')")
+                return cursor.rowcount
 
     def export_used_numbers(self):
-        import io
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """SELECT number, name, address, email, used_by_username, used_by_user_id, 
                        status, call_summary, used_at, summary_submitted_at 
-                       FROM number_queue 
-                       WHERE is_completed = TRUE
-                       ORDER BY used_at"""
+                       FROM number_queue WHERE is_completed = TRUE ORDER BY used_at"""
                 )
                 results = cursor.fetchall()
-
                 if not results:
                     return None, 0
 
                 output = io.StringIO()
                 output.write("Number,Name,Address,Email,Used By,User ID,Status,Summary,Used At,Summary At\n")
                 for row in results:
-                    status = row["status"] if row["status"] else "-"
-                    summary = row["call_summary"].replace('"', '""') if row["call_summary"] else "-"
-                    summary_at = row["summary_submitted_at"] if row["summary_submitted_at"] else "-"
-                    name = row["name"] if row["name"] else "-"
-                    address = row["address"] if row["address"] else "-"
-                    email = row["email"] if row["email"] else "-"
-                    output.write(
-                        f'{row["number"]},{name},"{address}",{email},{row["used_by_username"]},{row["used_by_user_id"]},{status},"{summary}",{row["used_at"]},{summary_at}\n'
-                    )
+                    status = row["status"] or "-"
+                    summary = (row["call_summary"] or "-").replace('"', '""')
+                    summary_at = row["summary_submitted_at"] or "-"
+                    name = row["name"] or "-"
+                    address = (row["address"] or "-").replace('"', '""')
+                    email = row["email"] or "-"
+                    output.write(f'{row["number"]},{name},"{address}",{email},{row["used_by_username"]},{row["used_by_user_id"]},{status},"{summary}",{row["used_at"]},{summary_at}\n')
 
                 cursor.execute("DELETE FROM number_queue WHERE is_completed = TRUE")
-                deleted_count = cursor.rowcount
-
-                return output.getvalue(), deleted_count
+                return output.getvalue(), cursor.rowcount
 
     def export_unused_numbers(self):
-        import io
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """SELECT number, name, address, email 
-                       FROM number_queue 
-                       WHERE is_used = FALSE AND is_completed = FALSE
-                       ORDER BY id"""
+                    "SELECT number, name, address, email FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE ORDER BY id"
                 )
                 results = cursor.fetchall()
-
                 if not results:
                     return None, 0
 
                 output = io.StringIO()
                 output.write("Number,Name,Address,Email\n")
                 for row in results:
-                    name = row["name"] if row["name"] else "-"
-                    address = row["address"] if row["address"] else "-"
-                    email = row["email"] if row["email"] else "-"
+                    name = row["name"] or "-"
+                    address = (row["address"] or "-").replace('"', '""')
+                    email = row["email"] or "-"
                     output.write(f'{row["number"]},{name},"{address}",{email}\n')
-
-                return output.getvalue(), 0
-
-    def export_all_numbers(self):
-        import io
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """SELECT number, name, address, email, is_used, used_by_username, 
-                       used_by_user_id, status, call_summary, used_at, added_at 
-                       FROM number_queue 
-                       ORDER BY id"""
-                )
-                results = cursor.fetchall()
-
-                if not results:
-                    return None, 0
-
-                output = io.StringIO()
-                output.write("Number,Name,Address,Email,Used,Username,User ID,Status,Summary,Used At,Added At\n")
-                for row in results:
-                    used = "Yes" if row["is_used"] else "No"
-                    name = row["name"] if row["name"] else "-"
-                    address = row["address"] if row["address"] else "-"
-                    email = row["email"] if row["email"] else "-"
-                    username = row["used_by_username"] if row["used_by_username"] else "-"
-                    user_id = row["used_by_user_id"] if row["used_by_user_id"] else "-"
-                    status = row["status"] if row["status"] else "-"
-                    summary = row["call_summary"].replace('"', '""') if row["call_summary"] else "-"
-                    used_at = row["used_at"] if row["used_at"] else "-"
-                    output.write(
-                        f'{row["number"]},{name},"{address}",{email},{used},{username},{user_id},{status},"{summary}",{used_at},{row["added_at"]}\n'
-                    )
-
-                cursor.execute("DELETE FROM number_queue")
-                deleted_count = cursor.rowcount
-
-                return output.getvalue(), deleted_count
+                return output.getvalue(), len(results)
 
     def export_no_answer_records(self):
-        import io
         with self.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """SELECT user_id, username, agent_name, reference, number, name, 
-                       address, email, created_at 
-                       FROM no_answer_records 
-                       ORDER BY created_at DESC"""
+                    "SELECT * FROM no_answer_records ORDER BY created_at DESC"
                 )
                 results = cursor.fetchall()
-
                 if not results:
                     return None, 0
 
                 output = io.StringIO()
                 output.write("User ID,Username,Agent Name,Reference,Number,Name,Address,Email,Date\n")
                 for row in results:
-                    name = row["name"] if row["name"] else "-"
-                    address = row["address"].replace('"', '""') if row["address"] else "-"
-                    email = row["email"] if row["email"] else "-"
-                    output.write(
-                        f'{row["user_id"]},{row["username"]},{row["agent_name"]},{row["reference"]},{row["number"]},{name},"{address}",{email},{row["created_at"]}\n'
-                    )
+                    name = row["name"] or "-"
+                    address = (row["address"] or "-").replace('"', '""')
+                    email = row["email"] or "-"
+                    output.write(f'{row["user_id"]},{row["username"]},{row["agent_name"]},{row["reference"]},{row["number"]},{name},"{address}",{email},{row["created_at"]}\n')
 
                 cursor.execute("DELETE FROM no_answer_records")
-                deleted_count = cursor.rowcount
+                return output.getvalue(), cursor.rowcount
 
-                return output.getvalue(), deleted_count
-
-    def add_admin(self, user_id: int, username: str, added_by: int):
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO admins (user_id, username, added_by) VALUES (%s, %s, %s)",
-                    (user_id, username, added_by),
-                )
-
-    def remove_admin(self, user_id: int) -> int:
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
-                return cursor.rowcount
-
-    def update_record_summary(self, user_id: int, summary: str):
-        with self.get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """UPDATE number_queue 
-                       SET call_summary = %s, summary_submitted_at = NOW() 
-                       WHERE used_by_user_id = %s""",
-                    (summary, user_id),
-                )
-
-
-    # ============= COMMANDS SETUP =============
+    # ==================== COMMANDS SETUP ====================
 
     async def set_bot_commands(self):
-        from aiogram.types import BotCommandScopeChat
-
         admin_commands = [
             BotCommand(command="start", description="Start the bot"),
-            BotCommand(command="line", description="Request a new line"),
+            BotCommand(command="stats", description="View queue statistics"),
             BotCommand(command="add", description="Add numbers manually"),
             BotCommand(command="upload", description="Upload CSV/TXT file"),
-            BotCommand(command="stats", description="View queue statistics"),
             BotCommand(command="reset", description="Reset all numbers"),
             BotCommand(command="clear", description="Delete all numbers"),
             BotCommand(command="clearrequests", description="Clear pending requests"),
             BotCommand(command="export_used", description="Export used numbers"),
             BotCommand(command="export_unused", description="Export unused numbers"),
-            BotCommand(command="export_all", description="Export all data"),
             BotCommand(command="export_no_answer", description="Export no answer records"),
+            BotCommand(command="addadmin", description="Add new admin"),
+            BotCommand(command="removeadmin", description="Remove admin"),
+            BotCommand(command="listadmins", description="List all admins"),
             BotCommand(command="stop", description="Stop the bot"),
         ]
+        user_commands = [BotCommand(command="start", description="Start the bot")]
 
-        user_commands = [
-            BotCommand(command="start", description="Start the bot"),
-        ]
-
-        await self.bot.set_my_commands(
-            admin_commands, scope=BotCommandScopeChat(chat_id=self.admin_id)
-        )
-
-        try:
-            admins = self.get_all_admins()
-            for adm in admins:
-                if adm["user_id"] != self.admin_id:
-                    try:
-                        await self.bot.set_my_commands(
-                            admin_commands,
-                            scope=BotCommandScopeChat(chat_id=adm["user_id"]),
-                        )
-                    except Exception as e:
-                        logging.error(
-                            f"Failed to set commands for admin {adm['user_id']}: {e}"
-                        )
-        except Exception as e:
-            logging.error(f"Error getting admins: {e}")
-
+        await self.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=self.admin_id))
+        for adm in self.get_all_admins():
+            if adm["user_id"] != self.admin_id:
+                try:
+                    await self.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=adm["user_id"]))
+                except:
+                    pass
         await self.bot.set_my_commands(user_commands)
-        logging.info(f"✅ Commands set for reference {self.reference}")
 
-    # ============= HANDLERS =============
+    # ==================== HANDLERS ====================
 
     def _register_handlers(self):
         r = self.router
 
+        # /start
         @r.message(Command("start"))
         async def cmd_start(message: Message, state: FSMContext):
             if message.chat.type != "private":
@@ -655,64 +428,44 @@ class LineBot:
             if message.from_user.id == self.admin_id:
                 status = self.get_bot_status()
                 if status == "stopped":
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, self.set_bot_status, "running")
-                    await message.answer(
-                        "▶️ <b>Bot restarted!</b>\n\nUsers can now request lines.",
-                        parse_mode="HTML",
-                    )
+                    self.set_bot_status("running")
+                    await message.answer("▶️ <b>Bot restarted!</b>", parse_mode="HTML")
                 else:
                     await message.answer(
                         f"🤖 <b>Admin Panel ({self.reference})</b>\n\n"
-                        "/stats - View queue statistics\n"
-                        "/reset - Reset all numbers\n"
-                        "/clear - Delete all numbers\n"
-                        "/export_used - Export used numbers\n"
-                        "/export_unused - Export remaining\n"
-                        "/export_all - Export everything",
-                        parse_mode="HTML",
+                        "/stats - Queue stats\n/add - Add numbers\n/upload - Upload file\n"
+                        "/export_used - Export used\n/export_unused - Export remaining",
+                        parse_mode="HTML"
                     )
                 return
 
             try:
-                member = await message.bot.get_chat_member(
-                    self.group_chat_id, message.from_user.id
-                )
-                if member.status == "kicked":
-                    await message.answer("⚠️ You're blocked from the group!")
-                    return
-                if member.status == "left":
+                member = await self.bot.get_chat_member(self.group_chat_id, message.from_user.id)
+                if member.status in ["kicked", "left"]:
                     await message.answer("⚠️ You must be a member of the group!")
                     return
-            except Exception:
+            except:
                 await message.answer("⚠️ You must be a member of the group!")
                 return
 
             loop = asyncio.get_event_loop()
-            user_info = await loop.run_in_executor(
-                None, self.get_user_info, message.from_user.id
-            )
+            user_info = await loop.run_in_executor(None, self.get_user_info, message.from_user.id)
 
             if user_info and user_info.get("agent_name"):
-                kb = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="Line 📞", callback_data="request_line")]
-                    ]
-                )
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Line 📞", callback_data="request_line")]
+                ])
                 await message.answer(
                     f"👋 Welcome back, <b>{user_info['agent_name']}</b>!\n\n"
                     f"🗃️ Reference: <code>{user_info['reference']}</code>\n\n"
                     "Press the button below to request a line",
-                    parse_mode="HTML",
-                    reply_markup=kb,
+                    parse_mode="HTML", reply_markup=kb
                 )
             else:
                 await state.set_state(UserStates.waiting_for_agent_name)
-                await message.answer(
-                    "👋 Welcome! Please enter your agent name:\n\nSend /cancel to abort.",
-                    parse_mode="HTML",
-                )
+                await message.answer("👋 Welcome! Please enter your agent name:")
 
+        # Agent name
         @r.message(UserStates.waiting_for_agent_name, F.text)
         async def receive_agent_name(message: Message, state: FSMContext):
             if message.text.startswith("/cancel"):
@@ -726,204 +479,125 @@ class LineBot:
                 return
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.save_agent_name, message.from_user.id, agent_name
-            )
+            await loop.run_in_executor(None, self.save_agent_name, message.from_user.id, agent_name)
 
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Line 📞", callback_data="request_line")]
-                ]
-            )
-
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Line 📞", callback_data="request_line")]
+            ])
             await message.answer(
-                f"✅ <b>Agent name saved!</b>\n\n"
-                f"👤 <b>Agent:</b> {agent_name}\n"
-                f"🗃️ Reference: <code>{self.reference}</code>\n\n"
-                "Press the button below to request a line",
-                parse_mode="HTML",
-                reply_markup=kb,
+                f"✅ <b>Agent name saved!</b>\n\n👤 <b>Agent:</b> {agent_name}\n"
+                f"🗃️ Reference: <code>{self.reference}</code>",
+                parse_mode="HTML", reply_markup=kb
             )
             await state.clear()
 
+        # Request line
         @r.callback_query(F.data == "request_line")
-        async def callback_request_line(callback: CallbackQuery, state: FSMContext):
+        async def callback_request_line(callback: CallbackQuery):
             user_id = callback.from_user.id
             username = callback.from_user.username or callback.from_user.first_name
 
-            try:
-                member = await self.bot.get_chat_member(self.group_chat_id, user_id)
-                if member.status == "kicked":
-                    await callback.message.answer("⚠️ You're blocked from the group!")
-                    await callback.answer()
-                    return
-                if member.status == "left":
-                    await callback.message.answer("⚠️ Join the group first!")
-                    await callback.answer()
-                    return
-            except Exception:
-                await callback.message.answer("⚠️ Join the group first!")
-                await callback.answer()
-                return
-
             status = self.get_bot_status()
             if status == "stopped":
-                await callback.message.answer(
-                    "⏸️ Bot is currently stopped.", parse_mode="HTML"
-                )
+                await callback.message.answer("⏸️ Bot is currently stopped.")
                 await callback.answer()
                 return
 
             loop = asyncio.get_event_loop()
 
-            # still prevent multiple active lines for same user
-            def check_has_active_line(uid: int):
+            # Check existing line
+            existing = await loop.run_in_executor(None, self.get_user_record, user_id)
+            if existing:
+                await callback.message.answer("❌ You already have an active line!")
+                await callback.answer()
+                return
+
+            # Assign new line
+            def assign_line():
                 with self.get_db_connection() as conn:
                     with conn.cursor() as cursor:
                         cursor.execute(
-                            """
-                            SELECT id FROM number_queue
-                            WHERE used_by_user_id = %s
-                              AND is_used = TRUE
-                              AND is_completed = FALSE
-                            LIMIT 1
-                            """,
-                            (uid,),
+                            "SELECT id, number, name, address, email FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE ORDER BY id LIMIT 1"
                         )
-                        return cursor.fetchone() is not None
+                        rec = cursor.fetchone()
+                        if rec:
+                            cursor.execute(
+                                "UPDATE number_queue SET is_used = TRUE, used_by_user_id = %s, used_by_username = %s, used_at = NOW() WHERE id = %s",
+                                (user_id, username, rec["id"])
+                            )
+                        return rec
 
-            has_line = await loop.run_in_executor(None, check_has_active_line, user_id)
-            if has_line:
-                await callback.message.answer("❌ You already have an active line! Use it first.")
-                await callback.answer()
-                return
-
-            # DIRECTLY assign next number (no number_requests, no admin approval)
-            record = await loop.run_in_executor(
-                None, self.get_next_number, user_id, username
-            )
+            record = await loop.run_in_executor(None, assign_line)
 
             if not record:
-                await callback.message.answer("❌ No lines available right now.")
+                await callback.message.answer("❌ No lines available!")
                 await callback.answer()
                 return
 
-            # fetch agent info
-            user_info = await loop.run_in_executor(
-                None, self.get_user_info, user_id
-            )
-            agent_name = (
-                user_info["agent_name"]
-                if user_info and user_info.get("agent_name")
-                else "Agent"
-            )
+            user_info = await loop.run_in_executor(None, self.get_user_info, user_id)
+            agent_name = user_info["agent_name"] if user_info else "Agent"
             reference = user_info["reference"] if user_info else self.reference
 
-            # build DM text similar to approve_line success
-            dm = ""
-            dm += f"👤 <b>Agent:</b> {agent_name}\n"
-            dm += f"🗃️ Reference: <code>{reference}</code>\n\n"
-            dm += "🎫 <b>Your Line:</b>\n\n"
+            dm = f"👤 <b>Agent:</b> {agent_name}\n🗃️ Reference: <code>{reference}</code>\n\n🎫 <b>Your Line:</b>\n\n"
             if record.get("name"):
                 dm += f"👤 Name: {record['name']}\n"
+            dm += f"📞 Number: <code>{record['number']}</code>\n"
             if record.get("address"):
                 dm += f"📍 Address: {record['address']}\n"
             if record.get("email"):
-                dm += f"✉️ Email: {record['email']}\n"
-            dm += f"📞 Number: <code>{record['number']}</code>\n\n"
-            dm += "✅ Please call this number now and then submit the call result."
+                dm += f"📧 Email: {record['email']}\n"
 
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="OTP 📞", callback_data=f"otp_{user_id}"
-                        ),
-                        InlineKeyboardButton(
-                            text="No Answer ❌",
-                            callback_data=f"noanswer_{user_id}",
-                        ),
-                    ]
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="OTP 📞", callback_data=f"otp_{user_id}"),
+                    InlineKeyboardButton(text="No Answer ❌", callback_data=f"noanswer_{user_id}")
                 ]
-            )
+            ])
+
+            await callback.message.answer(dm, parse_mode="HTML", reply_markup=kb)
 
             try:
-                await self.bot.send_message(
-                    chat_id=user_id, text=dm, reply_markup=kb, parse_mode="HTML"
-                )
-            except TelegramForbiddenError:
-                await callback.message.answer(
-                    "⚠️ Please start the bot in private first, then click /start again."
-                )
+                user_mention = callback.from_user.mention_html()
+                await self.bot.send_message(self.group_chat_id, f"✅ {user_mention} got a line", parse_mode="HTML")
+            except:
+                pass
 
             await callback.answer()
 
+        # OTP
         @r.callback_query(F.data.startswith("otp_"))
         async def callback_otp(callback: CallbackQuery):
             user_id = int(callback.data.split("_")[1])
-
             if callback.from_user.id != user_id:
                 await callback.answer("Not for you!", show_alert=True)
                 return
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_status, user_id, "OTP"
-            )
-
-            username = callback.from_user.username or callback.from_user.first_name
-            user_mention = callback.from_user.mention_html()
+            await loop.run_in_executor(None, self.update_record_status, user_id, "OTP")
 
             record = await loop.run_in_executor(None, self.get_user_record, user_id)
             user_info = await loop.run_in_executor(None, self.get_user_info, user_id)
-            agent_name = (
-                user_info["agent_name"]
-                if user_info and user_info.get("agent_name")
-                else "Agent"
-            )
+            agent_name = user_info["agent_name"] if user_info else "Agent"
             reference = user_info["reference"] if user_info else self.reference
 
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Need a Pass ⛹️",
-                            callback_data=f"need_pass_{user_id}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Finishing 🫡",
-                            callback_data=f"finishing_{user_id}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Vic Needs Callback ☎️",
-                            callback_data=f"vic_callback_{user_id}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Call Ended 📵",
-                            callback_data=f"call_ended_{user_id}",
-                        )
-                    ],
-                ]
-            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Need a Pass ⛹️", callback_data=f"need_pass_{user_id}")],
+                [InlineKeyboardButton(text="Needs an email 📧", callback_data=f"need_email_{user_id}")],
+                [InlineKeyboardButton(text="Finishing 🫡", callback_data=f"finishing_{user_id}")],
+                [InlineKeyboardButton(text="Vic Needs Callback ☎️", callback_data=f"vic_callback_{user_id}")],
+                [InlineKeyboardButton(text="Call Ended 📵", callback_data=f"call_ended_{user_id}")]
+            ])
 
             await callback.message.edit_text(
                 f"{callback.message.text}\n\n✅ Status: OTP 📞\n\nWhat do you need?",
-                reply_markup=kb,
+                reply_markup=kb
             )
 
             if record:
-                admin_msg = (
-                    f"📲 <b>{user_mention} is on call (OTP)</b>\n\n"
-                    f"👤 <b>Agent:</b> {agent_name}\n"
-                    f"🗃️ Reference: <code>{reference}</code>\n\n"
-                    "<b>🎫Line Details:</b>\n\n"
-                )
+                user_mention = callback.from_user.mention_html()
+                admin_msg = f"📲 <b>{user_mention} is on call (OTP)</b>\n\n"
+                admin_msg += f"👤 <b>Agent:</b> {agent_name}\n🗃️ Reference: <code>{reference}</code>\n\n"
+                admin_msg += "<b>🎫 Line Details:</b>\n"
                 if record.get("name"):
                     admin_msg += f"👤 Name: {record['name']}\n"
                 admin_msg += f"📞 Number: <code>{record['number']}</code>\n"
@@ -933,541 +607,319 @@ class LineBot:
                     admin_msg += f"📧 Email: {record['email']}\n"
 
                 try:
-                    await self.bot.send_message(
-                        chat_id=self.admin_id,
-                        text=admin_msg,
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logging.error(f"Error sending to master admin: {e}")
+                    await self.bot.send_message(self.admin_id, admin_msg, parse_mode="HTML")
+                except:
+                    pass
 
-                admins = await loop.run_in_executor(None, self.get_all_admins)
-                for adm in admins:
-                    if adm["user_id"] == self.admin_id:
-                        continue
-                    try:
-                        await self.bot.send_message(
-                            chat_id=adm["user_id"],
-                            text=admin_msg,
-                            parse_mode="HTML",
-                        )
-                    except Exception as e:
-                        logging.error(
-                            f"Error sending to admin {adm['user_id']}: {e}"
-                        )
+                for adm in await loop.run_in_executor(None, self.get_all_admins):
+                    if adm["user_id"] != self.admin_id:
+                        try:
+                            await self.bot.send_message(adm["user_id"], admin_msg, parse_mode="HTML")
+                        except:
+                            pass
 
             try:
-                await self.bot.send_message(
-                    chat_id=self.group_chat_id,
-                    text=f"📲 {user_mention} is on call",
-                )
-            except Exception as e:
-                logging.error(f"Error notifying group: {e}")
+                await self.bot.send_message(self.group_chat_id, f"📲 {callback.from_user.mention_html()} is on call", parse_mode="HTML")
+            except:
+                pass
 
             await callback.answer()
 
-        @r.callback_query(F.data.startswith("need_pass_"))
-        async def callback_need_pass(callback: CallbackQuery, state: FSMContext):
-            # data: need_pass_{user_id}
-            try:
-                user_id = int(callback.data.split("_")[2])
-            except (IndexError, ValueError):
-                await callback.answer("Invalid data.", show_alert=True)
-                return
-
+        # No Answer
+        @r.callback_query(F.data.startswith("noanswer_"))
+        async def callback_noanswer(callback: CallbackQuery):
+            user_id = int(callback.data.split("_")[1])
             if callback.from_user.id != user_id:
                 await callback.answer("Not for you!", show_alert=True)
                 return
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_status, user_id, "Need Pass"
-            )
+            await loop.run_in_executor(None, self.update_record_status, user_id, "No Answer")
 
-            await state.set_state(UserStates.waiting_for_summary)
-            await callback.message.answer(
-                "⛹️ You selected <b>Need a Pass</b>.\n\n"
-                "Send a short note/pass in one message.\n\n"
-                "Send /cancel to abort.",
-                parse_mode="HTML",
+            # Get record BEFORE marking completed
+            record = await loop.run_in_executor(None, self.get_user_record, user_id)
+
+            username = callback.from_user.username or callback.from_user.first_name
+            user_info = await loop.run_in_executor(None, self.get_user_info, user_id)
+            agent_name = user_info["agent_name"] if user_info else "Agent"
+            reference = user_info["reference"] if user_info else self.reference
+
+            if record:
+                await loop.run_in_executor(
+                    None, self.save_no_answer_record,
+                    user_id, username, agent_name, reference,
+                    record.get("number"), record.get("name"), record.get("address"), record.get("email")
+                )
+
+            # NOW mark completed
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            try:
+                await self.bot.send_message(self.group_chat_id, f"❌ {callback.from_user.mention_html()} - No Answer", parse_mode="HTML")
+            except:
+                pass
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
+            ])
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n❌ <b>No Answer</b>\n\nRequest another:",
+                parse_mode="HTML", reply_markup=kb
             )
             await callback.answer()
 
-        @r.message(UserStates.waiting_for_summary, F.text)
-        async def receive_need_pass_summary(message: Message, state: FSMContext):
-            data = await state.get_data()
-            user_id = data.get('user_id')
-            need_pass = data.get('need_pass', False)
-            summary_text = message.text
-
-            loop = asyncio.get_event_loop()
-            if message.text.startswith('/cancel'):
-                await state.clear()
-                await message.answer("❌ Cancelled.")
-                await loop.run_in_executor(None, self.update_record_summary, user_id, summary_text)
-                await loop.run_in_executor(None, self.mark_line_completed, user_id)
-                return
-
-            await loop.run_in_executor(None, self.update_record_summary, user_id, summary_text)
-            await loop.run_in_executor(None, self.mark_line_completed, user_id)
-
-            username = message.from_user.username or message.from_user.first_name
-            user_mention = message.from_user.mention_html()
-
-            # Send summary to group
-            try:
-                await self.bot.send_message(
-                    chat_id=self.group_chat_id,
-                    text=f"📋 <b>Summary from {user_mention}</b>\n\n{summary_text}",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logging.error(f"Error: {e}")
-
-            if need_pass:
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="Request New Line 🔄", callback_data=f"request_new_line_{user_id}")]
-                ])
-
-                await message.answer(
-                    "✅ <b>Summary submitted!</b>\n\nClick below to request a new line:",
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
-            else:
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="Request Another Line 🔄", callback_data=f"request_new_line_{user_id}")]
-                ])
-
-                await message.answer("✅ <b>Summary submitted!</b>", parse_mode="HTML", reply_markup=keyboard)
-
-            await state.clear()
-
-        @r.callback_query(F.data.startswith("finishing_"))
-        async def callback_finishing(callback: CallbackQuery, state: FSMContext):
-            # data: finishing_{user_id}
-            try:
-                user_id = int(callback.data.split("_")[1])
-            except (IndexError, ValueError):
-                await callback.answer("Invalid data.", show_alert=True)
-                return
-
-            if callback.from_user.id != user_id:
-                await callback.answer("Not for you!", show_alert=True)
-                return
-
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_status, user_id, "Finishing"
-            )
-
-            await state.set_state(UserStates.waiting_for_finishing_summary)
-            await callback.message.answer(
-                "🫡 You selected <b>Finishing</b>.\n\n"
-                "Send a short call summary (result / outcome).\n\n"
-                "Send /cancel to abort.",
-                parse_mode="HTML",
-            )
-            await callback.answer()
-
-        @r.message(UserStates.waiting_for_finishing_summary, F.text)
-        async def receive_finishing_summary(message: Message, state: FSMContext):
-            if message.text.startswith("/cancel"):
-                await state.clear()
-                await message.answer("❌ Cancelled.")
-                return
-
-            data = await state.get_data()
-            user_id = data.get("user_id")
-            summary_text = message.text.strip()
-
-            if not summary_text:
-                await message.answer("❌ Summary cannot be empty.")
-                return
-
-            loop = asyncio.get_event_loop()
-            # Save summary + mark completed
-            await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary_text
-            )
-            await loop.run_in_executor(None, self.mark_line_completed, user_id)
-
-            # Send summary to group (like old bot)
-            try:
-                user_mention = message.from_user.mention_html()
-                await self.bot.send_message(
-                    chat_id=self.group_chat_id,
-                    text=(
-                        f"🫡 <b>{user_mention} finishing call</b>\n\n"
-                        f"📝 <b>Summary:</b>\n{summary_text}"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logging.error(f"Error sending finishing summary to group: {e}")
-
-            # Button to request another line
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Request New Line 🔄", callback_data="request_line"
-                        )
-                    ]
-                ]
-            )
-
-            await message.answer(
-                "✅ <b>Finishing summary sent to group!</b>\n\n"
-                "You can now request a new line if needed.",
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
-
-            await state.clear()
-
-        @r.callback_query(F.data.startswith("vic_callback_"))
-        async def callback_vic_callback(callback: CallbackQuery, state: FSMContext):
-            # data: vic_callback_{user_id}
-            try:
-                user_id = int(callback.data.split("_")[2])
-            except (IndexError, ValueError):
-                await callback.answer("Invalid data.", show_alert=True)
-                return
-
-            if callback.from_user.id != user_id:
-                await callback.answer("Not for you!", show_alert=True)
-                return
-
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_status, user_id, "Vic Callback"
-            )
-
-            await state.set_state(UserStates.waiting_for_callback_summary)
-            await callback.message.answer(
-                "☎️ You selected <b>Vic Needs Callback</b>.\n\n"
-                "Send a short note on the callback requirement.\n\n"
-                "Send /cancel to abort.",
-                parse_mode="HTML",
-            )
-            await callback.answer()
-
-        @r.message(UserStates.waiting_for_callback_summary, F.text)
-        async def receive_callback_summary(message: Message, state: FSMContext):
-            data = await state.get_data()
-            user_id = data.get("user_id")
-            summary_text = message.text.strip()
-
-            loop = asyncio.get_event_loop()
-            if message.text.startswith("/cancel"):
-                await state.clear()
-                await message.answer("❌ Cancelled.")
-                # Old bot also marked line completed on cancel
-                await loop.run_in_executor(None, self.mark_line_completed, user_id)
-                return
-
-            if not summary_text:
-                await message.answer("❌ Summary cannot be empty.")
-                return
-
-            # Save summary + mark completed (line free for new call)
-            await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary_text
-            )
-            await loop.run_in_executor(None, self.mark_line_completed, user_id)
-
-            # Send summary to group (like old bot)
-            try:
-                user_mention = message.from_user.mention_html()
-                await self.bot.send_message(
-                    chat_id=self.group_chat_id,
-                    text=(
-                        f"☎️ <b>{user_mention} needs callback</b>\n\n"
-                        f"📝 <b>Summary:</b>\n{summary_text}"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logging.error(f"Error sending callback summary to group: {e}")
-
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Request New Line 🔄", callback_data="request_line"
-                        )
-                    ]
-                ]
-            )
-
-            await message.answer(
-                "✅ <b>Callback summary sent to group!</b>\n\n"
-                "You can now request a new line if needed.",
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
-
-            await state.clear()
-
+        # Call Ended
         @r.callback_query(F.data.startswith("call_ended_"))
         async def callback_call_ended(callback: CallbackQuery, state: FSMContext):
-            # data: call_ended_{user_id}
-            try:
-                user_id = int(callback.data.split("_")[2])
-            except (IndexError, ValueError):
-                await callback.answer("Invalid data.", show_alert=True)
-                return
-
+            user_id = int(callback.data.split("_")[2])
             if callback.from_user.id != user_id:
                 await callback.answer("Not for you!", show_alert=True)
                 return
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_status, user_id, "Call Ended"
-            )
+            await loop.run_in_executor(None, self.update_record_status, user_id, "Call Ended")
 
             await state.set_state(UserStates.waiting_for_call_ended_summary)
-            await callback.message.answer(
-                "📵 You selected <b>Call Ended</b>.\n\n"
-                "Send a short final summary of the call.\n\n"
-                "Send /cancel to abort.",
-                parse_mode="HTML",
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n📵 <b>Call Ended</b>\n\nPlease send a summary:",
+                parse_mode="HTML"
             )
             await callback.answer()
 
         @r.message(UserStates.waiting_for_call_ended_summary, F.text)
         async def receive_call_ended_summary(message: Message, state: FSMContext):
-            data = await state.get_data()
-            user_id = data.get("user_id")
-            summary_text = message.text.strip()
+            user_id = message.from_user.id
+            summary = message.text.strip()
 
             loop = asyncio.get_event_loop()
-            if message.text.startswith("/cancel"):
-                await state.clear()
-                await message.answer("❌ Cancelled.")
-                await loop.run_in_executor(None, self.mark_line_completed, user_id)
-                return
-
-            if not summary_text:
-                await message.answer("❌ Summary cannot be empty.")
-                return
-
-            # Save summary + mark completed
-            await loop.run_in_executor(
-                None, self.update_record_summary, user_id, summary_text
-            )
+            await loop.run_in_executor(None, self.update_record_summary, user_id, summary)
             await loop.run_in_executor(None, self.mark_line_completed, user_id)
 
-            # Send final call summary to group (like old bot)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
+            ])
+            await message.answer("✅ <b>Summary saved!</b>\n\nRequest another line:", parse_mode="HTML", reply_markup=kb)
+
             try:
-                user_mention = message.from_user.mention_html()
-                await self.bot.send_message(
-                    chat_id=self.group_chat_id,
-                    text=(
-                        f"📝 <b>{user_mention}'s Call Summary:</b>\n\n"
-                        f"{summary_text}"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logging.error(f"Error sending call-ended summary to group: {e}")
-
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Request New Line 🔄", callback_data="request_line"
-                        )
-                    ]
-                ]
-            )
-
-            await message.answer(
-                "✅ <b>Summary sent to group!</b>\n\n"
-                "You can now request a new line if needed.",
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
+                await self.bot.send_message(self.group_chat_id, f"📵 {message.from_user.mention_html()} - Call Ended", parse_mode="HTML")
+            except:
+                pass
 
             await state.clear()
 
-        @r.callback_query(F.data.startswith("noanswer_"))
-        async def callback_noanswer(callback: CallbackQuery):
+        # Finishing
+        @r.callback_query(F.data.startswith("finishing_"))
+        async def callback_finishing(callback: CallbackQuery, state: FSMContext):
             user_id = int(callback.data.split("_")[1])
-
             if callback.from_user.id != user_id:
                 await callback.answer("Not for you!", show_alert=True)
                 return
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self.update_record_status, user_id, "No Answer"
-            )
+            await loop.run_in_executor(None, self.update_record_status, user_id, "Finishing")
 
-            record = await loop.run_in_executor(None, self.get_user_record, user_id)
-
-            username = callback.from_user.username or callback.from_user.first_name
-            user_mention = callback.from_user.mention_html()
-
-            user_info = await loop.run_in_executor(None, self.get_user_info, user_id)
-            agent_name = (
-                user_info["agent_name"]
-                if user_info and user_info.get("agent_name")
-                else "Agent"
-            )
-            reference = user_info["reference"] if user_info else self.reference
-
-            if record:
-                await loop.run_in_executor(
-                    None,
-                    self.save_no_answer_record,
-                    user_id,
-                    username,
-                    agent_name,
-                    reference,
-                    record.get("number"),
-                    record.get("name"),
-                    record.get("address"),
-                    record.get("email"),
-                )
-
-            await loop.run_in_executor(None, self.mark_line_completed, user_id)
-
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Request Another Line 🔄",
-                            callback_data="request_line",
-                        )
-                    ]
-                ]
-            )
-
+            await state.set_state(UserStates.waiting_for_finishing_summary)
             await callback.message.edit_text(
-                f"{callback.message.text}\n\n❌ <b>No Answer</b>\n\nRequest another:",
-                parse_mode="HTML",
-                reply_markup=kb,
+                f"{callback.message.text}\n\n🫡 <b>Finishing</b>\n\nPlease send a summary:",
+                parse_mode="HTML"
             )
             await callback.answer()
 
-        @r.message(Command("stop"), F.from_user.id == self.admin_id)
-        async def cmd_stop(message: Message):
+        @r.message(UserStates.waiting_for_finishing_summary, F.text)
+        async def receive_finishing_summary(message: Message, state: FSMContext):
+            user_id = message.from_user.id
+            summary = message.text.strip()
+
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.set_bot_status, "stopped")
-            await message.answer(
-                "⏸️ <b>Bot stopped!</b>\n\nUsers can't request lines now.",
-                parse_mode="HTML",
-            )
+            await loop.run_in_executor(None, self.update_record_summary, user_id, summary)
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
 
-        @r.message(Command("reset"), F.from_user.id == self.admin_id)
-        async def cmd_reset(message: Message):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
+            ])
+            await message.answer("✅ <b>Summary saved!</b>\n\nRequest another line:", parse_mode="HTML", reply_markup=kb)
+
+            try:
+                await self.bot.send_message(self.group_chat_id, f"🫡 {message.from_user.mention_html()} - Finishing", parse_mode="HTML")
+            except:
+                pass
+
+            await state.clear()
+
+        # Vic Callback
+        @r.callback_query(F.data.startswith("vic_callback_"))
+        async def callback_vic_callback(callback: CallbackQuery, state: FSMContext):
+            user_id = int(callback.data.split("_")[2])
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
             loop = asyncio.get_event_loop()
-            count = await loop.run_in_executor(None, self.reset_queue)
-            await message.answer(
-                f"✅ Reset {count} lines (only non-completed).",
-                parse_mode="HTML",
+            await loop.run_in_executor(None, self.update_record_status, user_id, "Callback")
+
+            await state.set_state(UserStates.waiting_for_callback_summary)
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n☎️ <b>Vic Needs Callback</b>\n\nPlease send details:",
+                parse_mode="HTML"
             )
+            await callback.answer()
 
-        # ============= ADMIN COMMANDS =============
+        @r.message(UserStates.waiting_for_callback_summary, F.text)
+        async def receive_callback_summary(message: Message, state: FSMContext):
+            user_id = message.from_user.id
+            summary = message.text.strip()
 
-        @r.message(Command("stats"), F.from_user.id == self.admin_id)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.update_record_summary, user_id, summary)
+            await loop.run_in_executor(None, self.mark_line_completed, user_id)
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
+            ])
+            await message.answer("✅ <b>Callback saved!</b>\n\nRequest another line:", parse_mode="HTML", reply_markup=kb)
+
+            try:
+                await self.bot.send_message(self.group_chat_id, f"☎️ {message.from_user.mention_html()} - Callback Requested", parse_mode="HTML")
+            except:
+                pass
+
+            await state.clear()
+
+        # Need Pass
+        # Need Pass (updated to match email flow)
+        @r.callback_query(F.data.startswith("need_pass_"))
+        async def callback_need_pass(callback: CallbackQuery):
+            user_id = int(callback.data.split("_")[2])
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.update_record_status, user_id, "Need Pass")
+
+            try:
+                await self.bot.send_message(
+                    self.group_chat_id,
+                    f"⛹️ <b>User needs a pass</b>\n\n{callback.from_user.mention_html()}",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.error(f"[{self.reference}] Group notify error: {e}")
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Needs an email 📧", callback_data=f"need_email_{user_id}")],
+                [InlineKeyboardButton(text="Finishing 🫡", callback_data=f"finishing_{user_id}")],
+                [InlineKeyboardButton(text="Vic Needs Callback ☎️", callback_data=f"vic_callback_{user_id}")],
+                [InlineKeyboardButton(text="Call Ended 📵", callback_data=f"call_ended_{user_id}")]
+            ])
+
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n⛹️ <b>Pass Requested</b>",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            await callback.answer()
+
+        # Needs Email
+        @r.callback_query(F.data.startswith("need_email_"))
+        async def callback_need_email(callback: CallbackQuery):
+            user_id = int(callback.data.split("_")[2])
+            if callback.from_user.id != user_id:
+                await callback.answer("Not for you!", show_alert=True)
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.update_record_status, user_id, "Need Email")
+
+            try:
+                await self.bot.send_message(
+                    self.group_chat_id,
+                    f"📧 <b>User needs email sent</b>\n\n{callback.from_user.mention_html()}",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.error(f"[{self.reference}] Group notify error: {e}")
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Finishing 🫡", callback_data=f"finishing_{user_id}")],
+                [InlineKeyboardButton(text="Vic Needs Callback ☎️", callback_data=f"vic_callback_{user_id}")],
+                [InlineKeyboardButton(text="Call Ended 📵", callback_data=f"call_ended_{user_id}")]
+            ])
+
+            await callback.message.edit_text(
+                f"{callback.message.text}\n\n📧 <b>Email Requested</b>",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            await callback.answer()
+
+        # ==================== ADMIN COMMANDS ====================
+
+        @r.message(Command("stats"))
         async def cmd_stats(message: Message):
+            if not self.is_admin(message.from_user.id):
+                return
             loop = asyncio.get_event_loop()
             remaining, used = await loop.run_in_executor(None, self.get_queue_stats)
-
             await message.answer(
-                f"📊 <b>Queue Statistics ({self.reference})</b>\n\n"
-                f"📦 Available: <b>{remaining}</b>\n"
-                f"✅ Used: <b>{used}</b>\n"
-                f"📈 Total: <b>{remaining + used}</b>",
-                parse_mode="HTML",
+                f"📊 <b>Queue Stats ({self.reference})</b>\n\n"
+                f"📦 Available: <b>{remaining}</b>\n✅ Used: <b>{used}</b>\n📈 Total: <b>{remaining + used}</b>",
+                parse_mode="HTML"
             )
 
-        @r.message(Command("clearrequests"), F.from_user.id == self.admin_id)
-        async def cmd_clear_requests(message: Message):
-            loop = asyncio.get_event_loop()
-            count = await loop.run_in_executor(None, self.clear_pending_requests)
-            await message.answer(
-                f"✅ Cleared {count} pending requests.", parse_mode="HTML"
-            )
-
-        @r.message(Command("clear"), F.from_user.id == self.admin_id)
-        async def cmd_clear(message: Message):
-            loop = asyncio.get_event_loop()
-            count = await loop.run_in_executor(None, self.clear_queue)
-            await message.answer(
-                f"✅ Deleted {count} numbers from queue.", parse_mode="HTML"
-            )
-
-        @r.message(Command("add"), F.from_user.id == self.admin_id)
+        @r.message(Command("add"))
         async def cmd_add(message: Message, state: FSMContext):
+            if not self.is_admin(message.from_user.id):
+                return
             await state.set_state(AdminStates.waiting_for_numbers)
-            await message.answer(
-                "📝 Send me numbers (one per line).\n\nSend /done when finished.",
-                parse_mode="HTML",
-            )
             await state.update_data(numbers=[])
+            await message.answer("📝 Send numbers (one per line). Send /done when finished.")
+
+        @r.message(Command("done"), AdminStates.waiting_for_numbers)
+        async def cmd_done(message: Message, state: FSMContext):
+            data = await state.get_data()
+            numbers = data.get("numbers", [])
+            if not numbers:
+                await message.answer("❌ No numbers added!")
+                await state.clear()
+                return
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.add_numbers_to_queue, numbers)
+            await message.answer(f"✅ Added {len(numbers)} numbers!")
+            await state.clear()
 
         @r.message(AdminStates.waiting_for_numbers, F.text)
         async def receive_numbers(message: Message, state: FSMContext):
-            if message.text == "/done":
-                data = await state.get_data()
-                numbers = data.get("numbers", [])
+            if message.text.startswith("/"):
+                return
+            lines = [l.strip() for l in message.text.strip().split("\n") if l.strip()]
+            data = await state.get_data()
+            numbers = data.get("numbers", [])
+            numbers.extend(lines)
+            await state.update_data(numbers=numbers)
+            await message.answer(f"✅ Added {len(lines)}. Total: {len(numbers)}. Send /done to finish.")
 
-                if not numbers:
-                    await message.answer("❌ No numbers added!")
-                    await state.clear()
-                    return
-
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.add_numbers_to_queue, numbers)
-
-                await message.answer(
-                    f"✅ Added {len(numbers)} numbers to queue!",
-                    parse_mode="HTML",
-                )
-                await state.clear()
-            else:
-                lines = message.text.strip().split("\n")
-                data = await state.get_data()
-                numbers = data.get("numbers", [])
-                numbers.extend([line.strip() for line in lines if line.strip()])
-                await state.update_data(numbers=numbers)
-                await message.answer(
-                    f"✅ Added {len(lines)} numbers. Total: {len(numbers)}\n\nSend /done to finish.",
-                    parse_mode="HTML",
-                )
-
-        @r.message(Command("upload"), F.from_user.id == self.admin_id)
+        @r.message(Command("upload"))
         async def cmd_upload(message: Message, state: FSMContext):
+            if not self.is_admin(message.from_user.id):
+                return
             await state.set_state(AdminStates.waiting_for_file)
-            await message.answer(
-                "📤 Send me a CSV/TXT file with numbers.\n\n"
-                "Format: number,name,address,email\n\n"
-                "Send /cancel to abort.",
-                parse_mode="HTML",
-            )
+            await message.answer("📤 Send a CSV/TXT file. Format: number,name,address,email")
 
         @r.message(AdminStates.waiting_for_file, F.document)
         async def receive_file(message: Message, state: FSMContext):
-            import csv
-            import io
-
             file = message.document
             if not file.file_name.endswith((".csv", ".txt")):
-                await message.answer("❌ Only CSV/TXT files allowed!")
+                await message.answer("❌ Only CSV/TXT files!")
                 return
 
             file_data = await self.bot.download(file)
             content = file_data.read().decode("utf-8")
-
             reader = csv.reader(io.StringIO(content))
             records = []
             for row in reader:
-                if len(row) >= 1:
+                if row:
                     number = row[0].strip()
                     name = row[1].strip() if len(row) > 1 else None
                     address = row[2].strip() if len(row) > 2 else None
@@ -1475,309 +927,155 @@ class LineBot:
                     records.append((number, name, address, email))
 
             if not records:
-                await message.answer("❌ No valid records found!")
+                await message.answer("❌ No records found!")
                 await state.clear()
                 return
 
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.add_records_from_csv, records)
-
-            await message.answer(
-                f"✅ Uploaded {len(records)} records!", parse_mode="HTML"
-            )
+            await message.answer(f"✅ Uploaded {len(records)} records!")
             await state.clear()
 
-        @r.message(Command("export_used"), F.from_user.id == self.admin_id)
-        async def cmd_export_used(message: Message):
-            from aiogram.types import BufferedInputFile
+        @r.message(Command("reset"))
+        async def cmd_reset(message: Message):
+            if message.from_user.id != self.admin_id:
+                return
+            loop = asyncio.get_event_loop()
+            count = await loop.run_in_executor(None, self.reset_queue)
+            await message.answer(f"✅ Reset {count} lines.")
 
+        @r.message(Command("clear"))
+        async def cmd_clear(message: Message):
+            if message.from_user.id != self.admin_id:
+                return
+            loop = asyncio.get_event_loop()
+            count = await loop.run_in_executor(None, self.clear_queue)
+            await message.answer(f"✅ Deleted {count} numbers.")
+
+        @r.message(Command("clearrequests"))
+        async def cmd_clear_requests(message: Message):
+            if message.from_user.id != self.admin_id:
+                return
+            loop = asyncio.get_event_loop()
+            count = await loop.run_in_executor(None, self.clear_pending_requests)
+            await message.answer(f"✅ Cleared {count} requests.")
+
+        @r.message(Command("stop"))
+        async def cmd_stop(message: Message):
+            if message.from_user.id != self.admin_id:
+                return
+            self.set_bot_status("stopped")
+            await message.answer("⏸️ Bot stopped!")
+
+        @r.message(Command("export_used"))
+        async def cmd_export_used(message: Message):
+            if not self.is_admin(message.from_user.id):
+                return
             loop = asyncio.get_event_loop()
             csv_data, count = await loop.run_in_executor(None, self.export_used_numbers)
-
             if not csv_data:
-                await message.answer("ℹ️ No used numbers to export.")
+                await message.answer("ℹ️ No used numbers.")
                 return
+            file = BufferedInputFile(csv_data.encode(), filename="used_numbers.csv")
+            await message.answer_document(file, caption=f"✅ Exported {count} lines.")
 
-            file = BufferedInputFile(csv_data.encode("utf-8"), filename="used_numbers.csv")
-            await message.answer_document(
-                document=file,
-                caption=f"✅ Exported and deleted {count} completed lines.",
-            )
-
-        @r.message(Command("export_unused"), F.from_user.id == self.admin_id)
+        @r.message(Command("export_unused"))
         async def cmd_export_unused(message: Message):
-            from aiogram.types import BufferedInputFile
-
-            loop = asyncio.get_event_loop()
-            csv_data, _ = await loop.run_in_executor(None, self.export_unused_numbers)
-
-            if not csv_data:
-                await message.answer("ℹ️ No unused numbers to export.")
+            if not self.is_admin(message.from_user.id):
                 return
-
-            file = BufferedInputFile(
-                csv_data.encode("utf-8"), filename="unused_numbers.csv"
-            )
-            await message.answer_document(
-                document=file, caption="✅ Exported unused numbers (not deleted)."
-            )
-
-        @r.message(Command("export_all"), F.from_user.id == self.admin_id)
-        async def cmd_export_all(message: Message):
-            from aiogram.types import BufferedInputFile
-
             loop = asyncio.get_event_loop()
-            csv_data, count = await loop.run_in_executor(None, self.export_all_numbers)
-
+            csv_data, count = await loop.run_in_executor(None, self.export_unused_numbers)
             if not csv_data:
-                await message.answer("ℹ️ No numbers to export.")
+                await message.answer("ℹ️ No unused numbers.")
                 return
+            file = BufferedInputFile(csv_data.encode(), filename="unused_numbers.csv")
+            await message.answer_document(file, caption=f"✅ Exported {count} lines.")
 
-            file = BufferedInputFile(csv_data.encode("utf-8"), filename="all_numbers.csv")
-            await message.answer_document(
-                document=file, caption=f"✅ Exported and deleted {count} total lines."
-            )
-
-        @r.message(Command("export_no_answer"), F.from_user.id == self.admin_id)
+        @r.message(Command("export_no_answer"))
         async def cmd_export_no_answer(message: Message):
-            from aiogram.types import BufferedInputFile
-
-            loop = asyncio.get_event_loop()
-            csv_data, count = await loop.run_in_executor(
-                None, self.export_no_answer_records
-            )
-
-            if not csv_data:
-                await message.answer("ℹ️ No no-answer records to export.")
+            if not self.is_admin(message.from_user.id):
                 return
+            loop = asyncio.get_event_loop()
+            csv_data, count = await loop.run_in_executor(None, self.export_no_answer_records)
+            if not csv_data:
+                await message.answer("ℹ️ No records.")
+                return
+            file = BufferedInputFile(csv_data.encode(), filename="no_answer.csv")
+            await message.answer_document(file, caption=f"✅ Exported {count} records.")
 
-            file = BufferedInputFile(
-                csv_data.encode("utf-8"), filename="no_answer_records.csv"
-            )
-            await message.answer_document(
-                document=file, caption=f"✅ Exported and deleted {count} no-answer records."
-            )
-
-        @r.message(Command("listadmins"), F.from_user.id == self.admin_id)
-        async def cmd_list_admins(message: Message):
+        @r.message(Command("listadmins"))
+        async def cmd_listadmins(message: Message):
+            if message.from_user.id != self.admin_id:
+                return
             loop = asyncio.get_event_loop()
             admins = await loop.run_in_executor(None, self.get_all_admins)
-
-            text = f"<b>👑 Admin List ({self.reference})</b>\n\n"
-            text += f"<b>Master Admin:</b>\n• ID: <code>{self.admin_id}</code>\n\n"
-
+            text = f"<b>👑 Admins ({self.reference})</b>\n\nMaster: <code>{self.admin_id}</code>\n\n"
             if admins:
-                text += "<b>Other Admins:</b>\n"
-                for adm in admins:
-                    if adm["user_id"] != self.admin_id:
-                        text += f"• {adm['username']} (ID: <code>{adm['user_id']}</code>)\n"
-            else:
-                text += "<i>No other admins</i>"
+                for a in admins:
+                    text += f"• {a['username']} (<code>{a['user_id']}</code>)\n"
+            await message.answer(text, parse_mode="HTML")
 
-            await message.answer(text, parse_mode=ParseMode.HTML)
-
-        @r.message(Command("addadmin"), F.from_user.id == self.admin_id)
-        async def cmd_add_admin(message: Message, state: FSMContext):
-            if message.reply_to_message:
-                new_admin_id = message.reply_to_message.from_user.id
-                new_admin_username = (
-                        message.reply_to_message.from_user.username
-                        or message.reply_to_message.from_user.first_name
-                )
-
-                if new_admin_id == self.admin_id:
-                    await message.answer("❌ This user is already the master admin.")
-                    return
-
-                loop = asyncio.get_event_loop()
-
-                if await loop.run_in_executor(None, self.is_admin, new_admin_id):
-                    await message.answer(f"ℹ️ {new_admin_username} is already an admin.")
-                    return
-
-                try:
-                    await loop.run_in_executor(
-                        None, self.add_admin, new_admin_id, new_admin_username, self.admin_id
-                    )
-
-                    await message.answer(
-                        f"✅ <b>Admin Added!</b>\n\n"
-                        f"User: {new_admin_username}\n"
-                        f"ID: <code>{new_admin_id}</code>\n\n"
-                        f"They can now approve/decline line requests.",
-                        parse_mode=ParseMode.HTML,
-                    )
-
-                    try:
-                        await self.bot.send_message(
-                            chat_id=new_admin_id,
-                            text="🎉 You've been promoted to admin! You can now approve line requests.",
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except Exception:
-                        pass
-
-                except Exception as e:
-                    await message.answer(f"❌ Error adding admin: {e}")
-
+        @r.message(Command("addadmin"))
+        async def cmd_addadmin(message: Message, state: FSMContext):
+            if message.from_user.id != self.admin_id:
                 return
-
-            if message.chat.type == "private":
-                await state.set_state(AdminStates.waiting_for_forward)
-                await message.answer(
-                    "<b>👑 Add Admin</b>\n\n"
-                    "Forward me any message from the user you want to make admin.\n\n"
-                    "Send /cancel to cancel.",
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await message.answer("❌ Reply to a user's message or use this in private chat.")
+            if message.reply_to_message:
+                new_id = message.reply_to_message.from_user.id
+                new_name = message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name
+                if self.is_admin(new_id):
+                    await message.answer("Already an admin!")
+                    return
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self.add_admin, new_id, new_name, self.admin_id)
+                await message.answer(f"✅ Added {new_name} as admin!")
+                return
+            await state.set_state(AdminStates.waiting_for_forward)
+            await message.answer("Forward a message from the user to add as admin.")
 
         @r.message(AdminStates.waiting_for_forward, F.forward_from)
-        async def receive_forward_add_admin(message: Message, state: FSMContext):
-            new_admin_id = message.forward_from.id
-            new_admin_username = (
-                    message.forward_from.username or message.forward_from.first_name
-            )
-
-            if new_admin_id == self.admin_id:
-                await message.answer("❌ This user is already the master admin.")
+        async def receive_forward_admin(message: Message, state: FSMContext):
+            new_id = message.forward_from.id
+            new_name = message.forward_from.username or message.forward_from.first_name
+            if self.is_admin(new_id):
+                await message.answer("Already an admin!")
                 await state.clear()
                 return
-
             loop = asyncio.get_event_loop()
-
-            if await loop.run_in_executor(None, self.is_admin, new_admin_id):
-                await message.answer(f"ℹ️ {new_admin_username} is already an admin.")
-                await state.clear()
-                return
-
-            try:
-                await loop.run_in_executor(
-                    None, self.add_admin, new_admin_id, new_admin_username, self.admin_id
-                )
-                await message.answer(
-                    f"✅ <b>Admin Added!</b>\n\n"
-                    f"User: {new_admin_username}\n"
-                    f"ID: <code>{new_admin_id}</code>\n\n"
-                    f"They can now approve/decline line requests.",
-                    parse_mode=ParseMode.HTML,
-                )
-
-                try:
-                    await self.bot.send_message(
-                        chat_id=new_admin_id,
-                        text="🎉 You've been promoted to admin! You can now approve line requests.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-
-            except Exception as e:
-                await message.answer(f"❌ Error adding admin: {e}")
-
+            await loop.run_in_executor(None, self.add_admin, new_id, new_name, self.admin_id)
+            await message.answer(f"✅ Added {new_name} as admin!")
             await state.clear()
 
-        @r.message(Command("removeadmin"), F.from_user.id == self.admin_id)
-        async def cmd_remove_admin(message: Message, state: FSMContext):
-            if message.reply_to_message:
-                admin_to_remove = message.reply_to_message.from_user.id
-                admin_username = (
-                        message.reply_to_message.from_user.username
-                        or message.reply_to_message.from_user.first_name
-                )
-
-                if admin_to_remove == self.admin_id:
-                    await message.answer("❌ Cannot remove master admin.")
-                    return
-
-                loop = asyncio.get_event_loop()
-                count = await loop.run_in_executor(None, self.remove_admin, admin_to_remove)
-
-                if count > 0:
-                    await message.answer(
-                        f"✅ <b>Admin Removed!</b>\n\n"
-                        f"User: {admin_username}\n"
-                        f"ID: <code>{admin_to_remove}</code>\n\n"
-                        f"They can no longer approve line requests.",
-                        parse_mode=ParseMode.HTML,
-                    )
-
-                    try:
-                        await self.bot.send_message(
-                            chat_id=admin_to_remove,
-                            text="ℹ️ Your admin privileges have been removed.",
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except Exception:
-                        pass
-                else:
-                    await message.answer(f"❌ {admin_username} is not an admin.")
-
+        @r.message(Command("removeadmin"))
+        async def cmd_removeadmin(message: Message, state: FSMContext):
+            if message.from_user.id != self.admin_id:
                 return
-
-            if message.chat.type == "private":
-                await state.set_state(AdminStates.waiting_for_remove_forward)
-                await message.answer(
-                    "<b>👑 Remove Admin</b>\n\n"
-                    "Forward me any message from the admin you want to remove.\n\n"
-                    "Send /cancel to cancel.",
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await message.answer("❌ Reply to an admin's message or use this in private chat.")
+            if message.reply_to_message:
+                rm_id = message.reply_to_message.from_user.id
+                loop = asyncio.get_event_loop()
+                count = await loop.run_in_executor(None, self.remove_admin, rm_id)
+                await message.answer("✅ Removed!" if count else "❌ Not an admin.")
+                return
+            await state.set_state(AdminStates.waiting_for_remove_forward)
+            await message.answer("Forward a message from the admin to remove.")
 
         @r.message(AdminStates.waiting_for_remove_forward, F.forward_from)
-        async def receive_forward_remove_admin(message: Message, state: FSMContext):
-            admin_to_remove = message.forward_from.id
-            admin_username = (
-                    message.forward_from.username or message.forward_from.first_name
-            )
-
-            if admin_to_remove == self.admin_id:
-                await message.answer("❌ Cannot remove master admin.")
-                await state.clear()
-                return
-
+        async def receive_forward_remove(message: Message, state: FSMContext):
+            rm_id = message.forward_from.id
             loop = asyncio.get_event_loop()
-            count = await loop.run_in_executor(None, self.remove_admin, admin_to_remove)
-
-            if count > 0:
-                await message.answer(
-                    f"✅ <b>Admin Removed!</b>\n\n"
-                    f"User: {admin_username}\n"
-                    f"ID: <code>{admin_to_remove}</code>\n\n"
-                    f"They can no longer approve line requests.",
-                    parse_mode=ParseMode.HTML,
-                )
-
-                try:
-                    await self.bot.send_message(
-                        chat_id=admin_to_remove,
-                        text="ℹ️ Your admin privileges have been removed.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-            else:
-                await message.answer(f"❌ {admin_username} is not an admin.")
-
+            count = await loop.run_in_executor(None, self.remove_admin, rm_id)
+            await message.answer("✅ Removed!" if count else "❌ Not an admin.")
             await state.clear()
 
-    # ============= RUN BOT =============
+    # ==================== RUN ====================
 
     async def start(self):
-        logging.info(f"📦 Starting bot for reference {self.reference}...")
+        logging.info(f"[{self.reference}] Starting...")
         self.init_database()
 
-        self.bot = Bot(
-            token=self.bot_token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        )
+        self.bot = Bot(token=self.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         self.dp = Dispatcher(storage=MemoryStorage())
         self.dp.include_router(self.router)
 
         await self.set_bot_commands()
-
-        logging.info(f"🤖 Bot running for reference {self.reference}")
+        logging.info(f"[{self.reference}] Bot running!")
         await self.dp.start_polling(self.bot)
