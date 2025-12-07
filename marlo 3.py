@@ -2209,16 +2209,6 @@ async def callback_noanswer(callback: CallbackQuery, bot: Bot):
     # STEP 5: NOW mark line as completed ✅
     await loop.run_in_executor(None, mark_line_completed, user_id)
 
-    # STEP 6: Notify group
-    try:
-        await bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=f"❌ {user_mention} - No Answer",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.error(f"Error: {e}")
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Request Another Line 🔄", callback_data="request_line")]
     ])
