@@ -15,7 +15,8 @@ import logging
 from contextlib import contextmanager
 import io
 import csv
-
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+import io
 logging.basicConfig(level=logging.INFO)
 
 # Configuration
@@ -171,15 +172,15 @@ def init_database():
 
             logging.info("✅ Database tables initialized successfully")
 
-def save_agent_name(user_id, agent_name):
-    """Save or update agent name for user"""
+def save_agent_name(user_id, agent_name, username): # <--- Added username parameter
+    """Save or update agent name and username for user"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                f"""INSERT INTO users (user_id, agent_name, reference) 
-                   VALUES (%s, %s, '{REFERENCE}') 
-                   ON DUPLICATE KEY UPDATE agent_name = %s""",
-                (user_id, agent_name, agent_name)
+                """INSERT INTO users (user_id, agent_name, username, reference) 
+                   VALUES (%s, %s, %s, 'CB2061') 
+                   ON DUPLICATE KEY UPDATE agent_name = %s, username = %s""",
+                (user_id, agent_name, username, agent_name, username)
             )
 
 def get_user_info(user_id):
@@ -337,8 +338,24 @@ def get_next_number(user_id: int, username: str = None, force_new: bool = False)
                 return result
             return None
 
+def increment_score(user_id):
+    """Add 1 point to the user's score"""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE users SET score = score + 1 WHERE user_id = %s",
+                (user_id,)
+            )
 
-
+def get_leaderboard_data():
+    """Get top 10 agents by score"""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            # ADDED 'user_id' to the SELECT statement
+            cursor.execute(
+                "SELECT user_id, agent_name, score FROM users ORDER BY score DESC LIMIT 10"
+            )
+            return cursor.fetchall()
 
 def update_record_status(user_id: int, status: str):
     with get_db_connection() as conn:
@@ -557,7 +574,170 @@ def export_all_numbers():
             deleted_count = cursor.rowcount
 
             return output.getvalue(), deleted_count
+async def get_user_avatar_image(bot: Bot, user_id: int):
+    """Downloads user profile photo and returns PIL Image"""
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if not photos.photos:
+            return None  # User has no photo or privacy hidden
 
+        # Get the largest version of the photo
+        photo_file_id = photos.photos[0][-1].file_id
+        file_info = await bot.get_file(photo_file_id)
+
+        # Download content
+        f = io.BytesIO()
+        await bot.download_file(file_info.file_path, f)
+        f.seek(0)
+
+        return Image.open(f).convert("RGBA")
+    except Exception as e:
+        logging.warning(f"Could not fetch avatar for {user_id}: {e}")
+        return None
+
+
+def generate_leaderboard_image(leaders_data):
+    TEMPLATE_PATH = "template.png"
+
+    # --- COLORS ---
+    COLOR_TOP_NAME = (255, 255, 255)
+    COLOR_TOP_SCORE = (255, 215, 0)
+    COLOR_LIST_TEXT = (50, 20, 0)
+
+    try:
+        # CHANGED: Must be RGBA to handle transparency for round avatars
+        img = Image.open(TEMPLATE_PATH).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+        W, H = img.size
+    except FileNotFoundError:
+        return create_fallback_image("Error: template.png not found")
+
+    # --- FONTS ---
+    try:
+        font_size_large = int(H * 0.03)
+        font_size_small = int(H * 0.025)
+        font_top_name = ImageFont.truetype("fonts/Montserrat-Bold.ttf", font_size_large)
+        font_top_score = ImageFont.truetype("fonts/Montserrat-Bold.ttf", font_size_small)
+        font_list = ImageFont.truetype("fonts/Montserrat-Bold.ttf", font_size_small)
+    except:
+        default = ImageFont.load_default()
+        font_top_name = font_top_score = font_list = default
+
+    # --- CONFIGURATION (Preserved from your code) ---
+
+    TOP_CONFIG = {
+        1: {'x': W * 0.50, 'y_name': H * 0.33},  # Center
+        2: {'x': W * 0.33, 'y_name': H * 0.29},  # Left
+        3: {'x': W * 0.67, 'y_name': H * 0.29},  # Right
+    }
+
+    LIST_CONFIG = {
+        'start_y': H * 0.445,
+        'row_gap': H * 0.083,
+        'name_x': W * 0.43,
+        'score_x': W * 0.67
+    }
+
+    # --- AVATAR CONFIGURATION (New) ---
+    # Calculated based on your text positions
+
+    AVATAR_TOP = {
+        # x: Match text X. y: Positioned slightly above the name. size: Circle diameter.
+        1: {'x': W * 0.50, 'y': H * 0.19, 'size': int(W * 0.13)},
+        2: {'x': W * 0.33, 'y': H * 0.19, 'size': int(W * 0.083)},
+        3: {'x': W * 0.67, 'y': H * 0.19, 'size': int(W * 0.083)},
+    }
+
+    # List Avatars: Positioned to the left of 'name_x' (0.43)
+    LIST_AVATAR = {
+        'x': W * 0.37,  # Left of name
+        'size': int(H * 0.075)  # Approx pill height size
+    }
+
+    # --- HELPER: CIRCLE CROP ---
+    def make_circle(avatar_img, size):
+        avatar_img = ImageOps.fit(avatar_img, (size, size), centering=(0.5, 0.5))
+        mask = Image.new('L', (size, size), 0)
+        draw_mask = ImageDraw.Draw(mask)
+        draw_mask.ellipse((0, 0, size, size), fill=255)
+        output = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        output.paste(avatar_img, (0, 0), mask=mask)
+        return output
+
+    # --- DRAWING LOOP ---
+    for idx, data in enumerate(leaders_data):
+        rank = idx + 1
+        if rank > 9: break
+
+        name = data['agent_name'] or "Agent"
+        if len(name) > 9: name = name[:10] + "..."
+        score = f"{data['score']:,}"
+
+        # 1. DRAW AVATAR (If downloaded)
+        if data.get('avatar_obj'):
+            try:
+                if rank in AVATAR_TOP:
+                    cfg = AVATAR_TOP[rank]
+                    circle = make_circle(data['avatar_obj'], cfg['size'])
+                    # Paste centered on X
+                    paste_x = int(cfg['x'] - (cfg['size'] / 2))
+                    paste_y = int(cfg['y'])
+                    img.paste(circle, (paste_x, paste_y), circle)
+                else:
+                    # List logic
+                    list_idx = rank - 4
+                    row_center_y = LIST_CONFIG['start_y'] + (list_idx * LIST_CONFIG['row_gap']) + (
+                                LIST_CONFIG['row_gap'] / 2)
+
+                    circle = make_circle(data['avatar_obj'], LIST_AVATAR['size'])
+                    paste_x = int(LIST_AVATAR['x'] - (LIST_AVATAR['size'] / 2))
+                    paste_y = int(row_center_y - (LIST_AVATAR['size'] / 2))  # Center vertically in pill
+                    img.paste(circle, (paste_x, paste_y), circle)
+            except Exception as e:
+                print(f"Avatar error: {e}")
+
+        # 2. DRAW TEXT (Your Logic)
+        if rank in TOP_CONFIG:
+            cfg = TOP_CONFIG[rank]
+            center_x = cfg['x']
+            start_y = cfg['y_name']
+
+            draw.text((center_x, start_y), name, font=font_top_name, fill=COLOR_TOP_NAME, anchor="mt")
+            draw.text((center_x, start_y + (H * 0.035)), score, font=font_top_score, fill=COLOR_TOP_SCORE, anchor="mt")
+
+        else:
+            list_idx = rank - 4
+            row_center_y = LIST_CONFIG['start_y'] + (list_idx * LIST_CONFIG['row_gap']) + (LIST_CONFIG['row_gap'] / 2)
+            text_y = row_center_y - (H * 0.015)
+
+            draw.text((LIST_CONFIG['name_x'], text_y), name, font=font_list, fill=COLOR_LIST_TEXT, anchor="lm")
+            draw.text((LIST_CONFIG['score_x'], text_y), score, font=font_list, fill=COLOR_LIST_TEXT, anchor="rm")
+
+    output = io.BytesIO()
+    img.save(output, format='PNG')
+    output.seek(0)
+    return output
+
+
+def create_fallback_image(text):
+    img = Image.new('RGB', (800, 600), color=(50, 50, 50))
+    d = ImageDraw.Draw(img)
+    d.text((400, 300), text, fill=(255, 0, 0), anchor="mm")
+    output = io.BytesIO()
+    img.save(output, format='PNG')
+    output.seek(0)
+    return output
+
+
+def create_fallback_image(text):
+    """Helper to prevent crash if template is missing"""
+    img = Image.new('RGB', (800, 600), color=(50, 50, 50))
+    d = ImageDraw.Draw(img)
+    d.text((400, 300), text, fill=(255, 0, 0), anchor="mm")
+    output = io.BytesIO()
+    img.save(output, format='PNG')
+    output.seek(0)
+    return output
 
 # Router setup
 router = Router()
@@ -570,6 +750,8 @@ async def set_bot_commands(bot: Bot):
     # Commands for ADMIN
     admin_commands = [
         BotCommand(command="start", description="Start the bot"),
+        BotCommand(command="leaderboard", description="🏆 View Top Agents"),  # <--- ADDED THIS
+
         BotCommand(command="line", description="Request a new line"),
         BotCommand(command="add", description="Add numbers manually"),
         BotCommand(command="done", description="Confirm numbers addition"),
@@ -592,6 +774,8 @@ async def set_bot_commands(bot: Bot):
     # Commands for REGULAR USERS
     user_commands = [
         BotCommand(command="start", description="Start the bot"),
+        BotCommand(command="leaderboard", description="🏆 View Top Agents"),  # <--- ADDED THIS
+
     ]
 
     # Set commands for master admin
@@ -619,6 +803,40 @@ async def set_bot_commands(bot: Bot):
     await bot.set_my_commands(user_commands)
 
     logging.info("✅ Bot commands set!")
+
+@router.message(Command("leaderboard"))
+async def cmd_leaderboard(message: Message, bot: Bot):  # <--- Added bot argument
+    loop = asyncio.get_event_loop()
+
+    await message.answer("🎨 Fetching profiles & generating leaderboard...")
+
+    # 1. Fetch DB Data
+    leaders = await loop.run_in_executor(None, get_leaderboard_data)
+
+    if not leaders:
+        await message.answer("📉 No scores yet!")
+        return
+
+    # 2. Fetch Avatars (Async Loop)
+    # We create a list of tasks to fetch all photos at once (faster)
+    avatar_tasks = []
+    for row in leaders:
+        user_id = row['user_id']
+        avatar_tasks.append(get_user_avatar_image(bot, user_id))
+
+    # Wait for all downloads to finish
+    avatar_images = await asyncio.gather(*avatar_tasks)
+
+    # Attach images to the leader data
+    for idx, img_obj in enumerate(avatar_images):
+        leaders[idx]['avatar_obj'] = img_obj
+
+    # 3. Generate Image (Sync Executor)
+    image_bio = await loop.run_in_executor(None, generate_leaderboard_image, leaders)
+
+    # 4. Send
+    photo = BufferedInputFile(image_bio.getvalue(), filename="leaderboard.png")
+    await message.answer_photo(photo, caption="🏆 **Top Agents Leaderboard**")
 
 
 @router.message(Command("listadmins"), F.from_user.id == ADMIN_ID)
@@ -985,6 +1203,7 @@ async def receive_agent_name(message: Message, state: FSMContext):
         return
 
     user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
     agent_name = message.text.strip()
 
     if len(agent_name) < 2 or len(agent_name) > 50:
@@ -992,7 +1211,7 @@ async def receive_agent_name(message: Message, state: FSMContext):
         return
 
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, save_agent_name, user_id, agent_name)
+    await loop.run_in_executor(None, save_agent_name, user_id, agent_name, username)
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Line 📞", callback_data="request_line")]
@@ -1001,7 +1220,7 @@ async def receive_agent_name(message: Message, state: FSMContext):
     await message.answer(
         f"✅ <b>Agent name saved!</b>\n\n"
         f"👤 <b>Agent:</b> {agent_name}\n"
-        f"🗃️ Reference: <code>{REFERENCE}</code>\n\n"
+        f"🗃️ Reference: <code>CB2061</code>\n\n"
         "Press the button below to request a line",
         parse_mode="HTML",
         reply_markup=keyboard
@@ -1867,6 +2086,8 @@ async def receive_call_ended_summary(message: Message, state: FSMContext, bot: B
         return
 
     await loop.run_in_executor(None, mark_line_completed, user_id)
+    await loop.run_in_executor(None, increment_score, user_id)
+
 
     # Send summary to group (but don't save)
     try:
@@ -1946,6 +2167,8 @@ async def receive_finishing_summary(message: Message, state: FSMContext, bot: Bo
     loop = asyncio.get_event_loop()
 
     await loop.run_in_executor(None, mark_line_completed, user_id)
+    await loop.run_in_executor(None, increment_score, user_id)
+
 
     # Send summary to group (but don't save)
     try:
@@ -2023,6 +2246,8 @@ async def receive_callback_summary(message: Message, state: FSMContext, bot: Bot
 
     # Mark line as available (but DON'T save to call_backs table)
     await loop.run_in_executor(None, mark_line_completed, user_id)
+    await loop.run_in_executor(None, increment_score, user_id)
+
 
     # Send summary to group (but don't save)
     try:
@@ -2264,6 +2489,8 @@ async def receive_summary(message: Message, state: FSMContext, bot: Bot):
 
     await loop.run_in_executor(None, update_record_summary, user_id, summary_text)
     await loop.run_in_executor(None, mark_line_completed, user_id)
+    await loop.run_in_executor(None, increment_score, user_id)
+
 
 
     username = message.from_user.username or message.from_user.first_name
