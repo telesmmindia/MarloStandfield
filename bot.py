@@ -35,7 +35,7 @@ else:
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 7593649217
+ADMIN_ID = os.getenv("ADMIN_ID")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 REFERENCE = 'CB2061'
 
