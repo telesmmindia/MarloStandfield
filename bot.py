@@ -489,6 +489,11 @@ def reset_queue():
             )
             return cursor.rowcount
 
+def reset_scores():
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE users SET score = 0")
+
 
 
 def clear_queue():
@@ -772,6 +777,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="start", description="Start the bot"),
         BotCommand(command="line", description="Request a new line"),
         BotCommand(command="leaderboard", description="🏆 View Top Agents"), # <--- ADDED THIS
+        BotCommand(command="resetleaderboard", description="reset leaderboard (makes score to 0)"), # <--- ADDED THIS
         BotCommand(command="add", description="Add numbers manually"),
         BotCommand(command="done", description="Confirm numbers addition"),
         BotCommand(command="upload", description="Upload CSV/TXT file"),
@@ -841,6 +847,13 @@ async def cmd_list_admins(message: Message):
         text += "<i>No other admins</i>"
 
     await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("resetleaderboard"), F.from_user.id == ADMIN_ID)
+async def cmd_reset_leaderboard(message: Message):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, reset_scores)
+    await message.answer("🔄 <b>Leaderboard has been reset!</b> All scores are 0.", parse_mode="HTML")
 
 
 @router.message(Command("addadmin"), F.from_user.id == ADMIN_ID)
