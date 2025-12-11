@@ -8,6 +8,14 @@ import os
 BOT_CONFIGS = [
     "configs/bot1.env",
     "configs/bot2.env",
+    "configs/bot3.env",
+    "configs/bot4.env",
+    "configs/bot5.env",
+    "configs/bot6.env",
+    "configs/bot7.env",
+    "configs/bot8.env",
+    "configs/bot9.env",
+    "configs/bot10.env",
 ]
 
 PYTHON_EXEC = sys.executable  # Automatically finds the current python (venv or system)

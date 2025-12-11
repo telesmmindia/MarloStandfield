@@ -30,7 +30,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
     'password': '3kkxb7jdfh',
-    'database': 'marlo_createlines',
+    'database': '',
     'charset': 'utf8mb4',
     'cursorclass': DictCursor
 }
