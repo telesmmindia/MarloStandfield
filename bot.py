@@ -1461,6 +1461,19 @@ async def handle_file_upload(message: Message, state: FSMContext, bot: Bot):
         file_content = await bot.download_file(file.file_path)
 
         content = file_content.read().decode('utf-8')
+        
+        # 1. Try Mixed Format Parser first (for Bk fullz etc)
+        mixed_records = parse_mixed_formats(content)
+        if mixed_records:
+             records = mixed_records
+             await message.answer(f"✅ <b>Imported {len(records)} records (Mixed Format)!</b>", parse_mode="HTML")
+             
+             loop = asyncio.get_event_loop()
+             await loop.run_in_executor(None, add_records_from_csv, records)
+             await state.clear()
+             return
+
+        # 2. Fallback to CSV
         csv_reader = csv.reader(io.StringIO(content))
 
         # Read header and detect columns
@@ -1681,6 +1694,9 @@ def parse_mixed_formats(text):
                 rec.get('mmn')
             ))
 
+    if not lines:
+        return []
+
     for line in lines:
         line_clean = line.strip()
         if not line_clean:
@@ -1790,10 +1806,20 @@ def parse_mixed_formats(text):
 
 
 @router.message(AdminStates.waiting_for_numbers)
-async def receive_numbers(message: Message, state: FSMContext):
+async def receive_numbers(message: Message, state: FSMContext, bot: Bot):
+    
+    # Handle File Upload Redirection if user sends file here
+    if message.document:
+        await handle_file_upload(message, state, bot)
+        return
+
     data = await state.get_data()
     numbers = data.get('numbers', [])
     text = message.text
+    
+    if not text:
+         await message.answer("⚠️ Please send text or a valid text/csv file.")
+         return
     
     # 1. Try generic mixed format parser
     # It catches almost anything with "Phone:" or "Mobile:" labels
