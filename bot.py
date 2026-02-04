@@ -1611,11 +1611,11 @@ def parse_mixed_formats(text):
     # ORDER MATTERS: Specific keys should be checked before generic ones if there's overlap.
     key_map = {
         'mobile': [r'mobile', r'phone', r'telephone', r'tel'], # distinct from generic 'number' if any
-        'name': [r'full name', r'first name', r'name'], # Removed 'card holder' to avoid flush
-        'last_name': [r'last name', r'surname'], # Special handling to append
+        'name': [r'full[ -]?name', r'first[ -]?name', r'name'], # Handle Full-Name, First-Name
+        'last_name': [r'last[ -]?name', r'surname'], 
         'address': [r'address', r'address line 1', r'address 1'],
         'address_line': [r'address line #?\d+', r'address \d+'], # Catch-all for lines
-        'postcode': [r'post code', r'zip code', r'postcode', r'zip'],
+        'postcode': [r'post[ -]?code', r'zip code', r'zip'],
         'town': [r'town', r'city'],
         'email': [r'email', r'email address'],
         'dob': [r'dob', r'date of birth'],
@@ -1712,7 +1712,7 @@ def parse_mixed_formats(text):
             pass
 
         # Detect specific headers that implies start of new person
-        if "Personal Information" in line_clean:
+        if "Personal Information" in line_clean or "Personal Login" in line_clean:
             # Usage: "+ Personal Information"
             # If we already have a mobile/name in current_record, this likely starts a NEW one.
             if current_record.get('mobile') or current_record.get('name'):
@@ -1750,6 +1750,12 @@ def parse_mixed_formats(text):
                         # Cleanup value: remove trailing chars like |
                         value = re.sub(r"[\+|]+$", "", value).strip()
                         
+                        # Handle inline pipes (e.g. "Address: ... | Address Line 2: ...")
+                        # If value contains '|', split it (UNLESS it's bin_info)
+                        if field != 'bin_info' and '|' in value:
+                             # Taking the part before the pipe
+                             value = value.split('|')[0].strip()
+                        
                         # Filter out header garbage
                         # If value is "Information", it was "Address Information" -> Ignore
                         if value.lower() in ['information', 'info']:
@@ -1766,7 +1772,7 @@ def parse_mixed_formats(text):
                         elif field == 'name':
                             # If we already have a name, this might be a new record 
                             # UNLESS it's compatible?
-                            # In Bk Fullz: "First Name" ... then "Last Name" (field=last_name)
+                            # In Bk fullz: "First Name" ... then "Last Name" (field=last_name)
                             if current_record.get('name'):
                                 flush_record(current_record)
                                 current_record = {}
