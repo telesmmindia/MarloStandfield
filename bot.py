@@ -186,7 +186,34 @@ def init_database():
 
             logging.info("✅ Database tables initialized successfully")
 
-# FIND THIS FUNCTION AND REPLACE IT
+            # Check and update schema for new columns
+            check_and_update_schema(conn)
+
+def check_and_update_schema(conn):
+    """Safely add new columns if they don't exist"""
+    with conn.cursor() as cursor:
+        # Check if card_number exists
+        cursor.execute("SHOW COLUMNS FROM number_queue LIKE 'card_number'")
+        if not cursor.fetchone():
+            logging.info("⚙️ Updating schema: Adding card details columns...")
+            try:
+                cursor.execute("""
+                    ALTER TABLE number_queue
+                    ADD COLUMN card_holder VARCHAR(255) DEFAULT NULL,
+                    ADD COLUMN card_number VARCHAR(50) DEFAULT NULL,
+                    ADD COLUMN card_expiry VARCHAR(20) DEFAULT NULL,
+                    ADD COLUMN cvv VARCHAR(10) DEFAULT NULL,
+                    ADD COLUMN sortcode VARCHAR(20) DEFAULT NULL,
+                    ADD COLUMN account_number VARCHAR(50) DEFAULT NULL,
+                    ADD COLUMN bin_info VARCHAR(255) DEFAULT NULL,
+                    ADD COLUMN dob VARCHAR(50) DEFAULT NULL,
+                    ADD COLUMN mmn VARCHAR(255) DEFAULT NULL
+                """)
+                conn.commit()
+                logging.info("✅ Schema updated successfully!")
+            except Exception as e:
+                logging.error(f"❌ Schema update failed: {e}")
+
 def save_agent_name(user_id, agent_name, username): # <--- Added username parameter
     """Save or update agent name and username for user"""
     with get_db_connection() as conn:
@@ -286,8 +313,23 @@ def add_numbers_to_queue(numbers_list):
 def add_records_from_csv(records_list):
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            query = """INSERT INTO number_queue (number, name, address, email) 
-                       VALUES (%s, %s, %s, %s)"""
+            # Check if we have extended records (with card details)
+            # Normal tuple: (number, name, address, email) -> len 4
+            # Extended tuple: (number, name, address, email, card_holder, card_number, ...) -> len > 4
+            
+            if not records_list:
+                return
+
+            if len(records_list[0]) > 4:
+                # Extended insert
+                query = """INSERT INTO number_queue 
+                           (number, name, address, email, card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn) 
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+            else:
+                # Standard insert
+                query = """INSERT INTO number_queue (number, name, address, email) 
+                           VALUES (%s, %s, %s, %s)"""
+            
             cursor.executemany(query, records_list)
 
 def clear_pending_requests():
@@ -353,7 +395,11 @@ def get_next_number(user_id: int, username: str = None, force_new: bool = False)
 
             # Get first unused number - EXCLUDE COMPLETED
             cursor.execute(
-                "SELECT id, number, name, address, email FROM number_queue WHERE is_used = FALSE AND is_completed = FALSE ORDER BY id LIMIT 1"
+                """SELECT id, number, name, address, email, 
+                          card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn 
+                   FROM number_queue 
+                   WHERE is_used = FALSE AND is_completed = FALSE 
+                   ORDER BY id LIMIT 1"""
             )
             result = cursor.fetchone()
 
@@ -753,15 +799,7 @@ def create_fallback_image(text):
     return output
 
 
-def create_fallback_image(text):
-    """Helper to prevent crash if template is missing"""
-    img = Image.new('RGB', (800, 600), color=(50, 50, 50))
-    d = ImageDraw.Draw(img)
-    d.text((400, 300), text, fill=(255, 0, 0), anchor="mm")
-    output = io.BytesIO()
-    img.save(output, format='PNG')
-    output.seek(0)
-    return output
+
 
 
 # Router setup
@@ -1539,11 +1577,116 @@ async def finish_adding(message: Message, state: FSMContext):
     await state.clear()
 
 
+    await state.update_data(numbers=numbers, mapping=mapping)
+    await message.answer(f"✅ Parsed {len(numbers)} records correctly!")
+
+
+def parse_bk_fullz_format(text):
+    """
+    Parses the specific 'Bk fullz' format text blocks.
+    Returns a list of tuples: 
+    (number, name, address, email, card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn)
+    """
+    import re
+    
+    # Split by the separator lines
+    blocks = re.split(r'\+ -{10,}\+\n\+ Personal Information', text)
+    records = []
+
+    for block in blocks:
+        if not block.strip():
+            continue
+            
+        # Helper to extract value by key
+        def get_val(key, data):
+            # Look for "| Key : Value"
+            match = re.search(rf'\|\s*{re.escape(key)}\s*:\s*(.*)', data, re.IGNORECASE)
+            return match.group(1).strip() if match else None
+
+        # Extract Personal Info
+        first_name = get_val("First Name", block)
+        last_name = get_val("Last Name", block)
+        dob = get_val("DOB", block)
+        mmn = get_val("MMN", block)
+        
+        full_name = f"{first_name or ''} {last_name or ''}".strip()
+        
+        # Extract Address Info
+        addr1 = get_val("Address Line #1", block)
+        addr2 = get_val("Address Line #2", block)
+        addr3 = get_val("Address Line #3", block)
+        town = get_val("Town", block)
+        postcode = get_val("Post Code", block)
+        
+        # Combine address
+        address_parts = [p for p in [addr1, addr2, addr3, town, postcode] if p]
+        address = ", ".join(address_parts)
+        
+        mobile = get_val("Mobile Number", block)
+        if not mobile:
+            # Try to find mobile in the chunk if regex failed slightly or format varies
+            match = re.search(r'\|\s*Mobile Number\s*:\s*(\d+)', block)
+            if match:
+                mobile = match.group(1)
+
+        # Extract Card Info
+        card_holder = get_val("Card Holder", block)
+        card_number = get_val("Card Number", block)
+        card_expiry = get_val("Card Expiry", block)
+        cvv = get_val("CVV", block)
+        sortcode = get_val("Sortcode", block)
+        account_number = get_val("Account Number", block)
+        bin_info = get_val("BIN Info", block)
+        
+        # We don't have email in this format? User example shows NULL for email usually?
+        # Check if "Email" exists
+        email = get_val("Email", block)
+
+        if mobile: # Valid record if we at least have a number
+             records.append((
+                 mobile, 
+                 full_name, 
+                 address, 
+                 email, 
+                 card_holder, 
+                 card_number, 
+                 card_expiry, 
+                 cvv, 
+                 sortcode, 
+                 account_number, 
+                 bin_info,
+                 dob,
+                 mmn
+             ))
+
+    return records
+
+
 @router.message(AdminStates.waiting_for_numbers)
 async def receive_numbers(message: Message, state: FSMContext):
     data = await state.get_data()
     numbers = data.get('numbers', [])
+    
+    text = message.text
+    
+    # 1. Try passing as Bk Fullz format first
+    if "Personal Information" in text and "Card Information" in text:
+        bk_records = parse_bk_fullz_format(text)
+        if bk_records:
+            # We found records!
+            # Extend existing list (handle mixed types if necessary, but usually one batch is one type)
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, add_records_from_csv, bk_records)
+                await message.answer(f"✅ <b>Parsed & Added {len(bk_records)} Fullz records!</b>", parse_mode="HTML")
+                await state.clear()
+                return
+            except Exception as e:
+                await message.answer(f"❌ Error adding fullz: {e}")
+                logging.error(f"Fullz add error: {e}")
+                return
 
+    # 2. Fallback to existing CSV parser
     # Parse as CSV with proper quote handling
     csv_reader = csv.reader(io.StringIO(message.text))
 
@@ -1581,7 +1724,7 @@ async def receive_numbers(message: Message, state: FSMContext):
             numbers.append((number, name, address, email))
 
     await state.update_data(numbers=numbers, mapping=mapping)
-    await message.answer(f"✅ Parsed {len(numbers)} records correctly!")
+    await message.answer(f"✅ Parsed {len(numbers)} CSV records correctly!")
 
 
 # Stats command
@@ -1787,13 +1930,34 @@ async def callback_request_line(callback: CallbackQuery, state: FSMContext, bot:
     dm_message += f"🗃️ Reference: <code>{reference}</code>\n\n"
     dm_message += "🎫 <b>Your Line:</b>\n\n"
 
+    # Personal Info
     if record.get("name"):
         dm_message += f"👤 Name: {record['name']}\n"
+    if record.get("dob"):
+        dm_message += f"📅 DOB: {record['dob']}\n"
+    if record.get("mmn"):
+        dm_message += f"👩 MMN: {record['mmn']}\n"
+        
     dm_message += f"📞 Number: <code>{record['number']}</code>\n"
+    
     if record.get("address"):
         dm_message += f"📍 Address: {record['address']}\n"
     if record.get("email"):
         dm_message += f"📧 Email: {record['email']}\n"
+
+    # Card Info
+    if record.get("card_number"):
+        dm_message += "\n💳 <b>Card Details:</b>\n"
+        dm_message += f"Card Holder: {record.get('card_holder') or '-'}\n"
+        dm_message += f"CC: <code>{record.get('card_number')}</code>\n"
+        dm_message += f"Exp: {record.get('card_expiry') or '-'}\n"
+        dm_message += f"CVV: {record.get('cvv') or '-'}\n"
+        if record.get('sortcode'):
+            dm_message += f"Sort: {record.get('sortcode')}\n"
+        if record.get('account_number'):
+            dm_message += f"Acc: {record.get('account_number')}\n"
+        if record.get('bin_info'):
+            dm_message += f"BIN: {record.get('bin_info')}\n"
 
     # 7) OTP / No Answer buttons
     keyboard = InlineKeyboardMarkup(
