@@ -1581,84 +1581,138 @@ async def finish_adding(message: Message, state: FSMContext):
     await message.answer(f"✅ Parsed {len(numbers)} records correctly!")
 
 
-def parse_bk_fullz_format(text):
+
+def parse_mixed_formats(text):
     """
-    Parses the specific 'Bk fullz' format text blocks.
-    Returns a list of tuples: 
-    (number, name, address, email, card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn)
+    Parses mixed text formats (Bk fullz, O2, variations).
+    Returns list of records tuples.
     """
     import re
-    
-    # Split by the separator lines
-    blocks = re.split(r'\+ -{10,}\+\n\+ Personal Information', text)
     records = []
 
-    for block in blocks:
-        if not block.strip():
+    # 1. Normalize text to make splitting easier
+    # Replace common separators with newlines to help line-by-line processing if needed
+    # But keep structure for block detection.
+
+    # Strategy: Find "blocks" of data. 
+    # Most formats have a "Name" or "Personal Information" or "Billing" header/start.
+    # We can use a sliding window or regex to find "starts" of records.
+    
+    # Let's try to split by some common delimitters that appear between records
+    # The user data has:
+    # "+ -----------------+"
+    # "Username           :" (O2 style)
+    # "----------- Personal Login -----------"
+    # "Name :"
+    
+    # We will look for a reliable "start of record" marker.
+    # "number" or "phone" is essential, so we can also look for valid phone numbers and search "around" them.
+    # BUT finding the boundaries is hard.
+    
+    # ALTERNATIVE: processing line by line and building a current record.
+    # When we see a "new record signal" (like a repeated key that we already found for current record), we flush the old one.
+    
+    current_record = {}
+    lines = text.split('\n')
+    
+    # Keys we want to map to standard fields
+    key_map = {
+        'number': [r'mobile', r'phone', r'telephone', r'tel'],
+        'name': [r'full name', r'first name', r'name', r'card holder', r'cardholder'], # 'card holder' as fallback if name missing
+        'address': [r'address', r'address line 1', r'address 1'],
+        'postcode': [r'post code', r'zip code', r'postcode', r'zip'],
+        'town': [r'town', r'city'],
+        'email': [r'email'],
+        'dob': [r'dob', r'date of birth'],
+        'mmn': [r'mmn', r'mother'],
+        'card_number': [r'card number', r'cc num'],
+        'card_holder': [r'card holder', r'cardholder name'],
+        'card_expiry': [r'card exp', r'expiry date', r'exp date', r'expiry'],
+        'cvv': [r'cvv', r'security code', r'cvc'],
+        'sortcode': [r'sort ?code'],
+        'account_number': [r'account number', r'account'],
+        'bin_info': [r'bin info', r'card bin', r'bin'],
+    }
+
+    def flush_record(rec):
+        if rec.get('number'):
+            # Construct standard tuple
+            # (number, name, address, email, card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn)
+            
+            # Combine address parts if found separate
+            addr_full = rec.get('address', '')
+            if rec.get('town') and rec.get('town') not in addr_full:
+                addr_full += f", {rec['town']}"
+            if rec.get('postcode') and rec.get('postcode') not in addr_full:
+                addr_full += f", {rec['postcode']}"
+                
+            records.append((
+                rec['number'],
+                rec.get('name'),
+                addr_full.strip(', '),
+                rec.get('email'),
+                rec.get('card_holder'),
+                rec.get('card_number'),
+                rec.get('card_expiry'),
+                rec.get('cvv'),
+                rec.get('sortcode'),
+                rec.get('account_number'),
+                rec.get('bin_info'),
+                rec.get('dob'),
+                rec.get('mmn')
+            ))
+    
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean:
             continue
             
-        # Helper to extract value by key
-        def get_val(key, data):
-            # Look for "| Key : Value"
-            match = re.search(rf'\|\s*{re.escape(key)}\s*:\s*(.*)', data, re.IGNORECASE)
-            return match.group(1).strip() if match else None
+        # Detect key-value using regex for flexibility
+        # Matches: "Key : Value", "Key: Value", "| Key : Value", "Key Value" (harder)
+        # We look for specific keys.
+        
+        found_key = False
+        lower_line = line_clean.lower()
+        
+        for field, keywords in key_map.items():
+            for kw in keywords:
+                # Regex to find "Keyword[:|] Value"
+                # Handle cases like "| Phone : 07..." or "Phone: 07..." or "Phone 07..."
+                pattern = rf"(?:^|[|]|\+)\s*{kw}\s*[:|=]?\s+(.*)"
+                match = re.search(pattern, lower_line)
+                if not match:
+                    # Try tighter match for things that might not have colon if strict
+                    # But for now assume some separator or distinct start
+                    continue
 
-        # Extract Personal Info
-        first_name = get_val("First Name", block)
-        last_name = get_val("Last Name", block)
-        dob = get_val("DOB", block)
-        mmn = get_val("MMN", block)
-        
-        full_name = f"{first_name or ''} {last_name or ''}".strip()
-        
-        # Extract Address Info
-        addr1 = get_val("Address Line #1", block)
-        addr2 = get_val("Address Line #2", block)
-        addr3 = get_val("Address Line #3", block)
-        town = get_val("Town", block)
-        postcode = get_val("Post Code", block)
-        
-        # Combine address
-        address_parts = [p for p in [addr1, addr2, addr3, town, postcode] if p]
-        address = ", ".join(address_parts)
-        
-        mobile = get_val("Mobile Number", block)
-        if not mobile:
-            # Try to find mobile in the chunk if regex failed slightly or format varies
-            match = re.search(r'\|\s*Mobile Number\s*:\s*(\d+)', block)
-            if match:
-                mobile = match.group(1)
-
-        # Extract Card Info
-        card_holder = get_val("Card Holder", block)
-        card_number = get_val("Card Number", block)
-        card_expiry = get_val("Card Expiry", block)
-        cvv = get_val("CVV", block)
-        sortcode = get_val("Sortcode", block)
-        account_number = get_val("Account Number", block)
-        bin_info = get_val("BIN Info", block)
-        
-        # We don't have email in this format? User example shows NULL for email usually?
-        # Check if "Email" exists
-        email = get_val("Email", block)
-
-        if mobile: # Valid record if we at least have a number
-             records.append((
-                 mobile, 
-                 full_name, 
-                 address, 
-                 email, 
-                 card_holder, 
-                 card_number, 
-                 card_expiry, 
-                 cvv, 
-                 sortcode, 
-                 account_number, 
-                 bin_info,
-                 dob,
-                 mmn
-             ))
-
+                value = match.group(1).strip()
+                # Clean up value (remove trailing | or +)
+                value = re.sub(r"[\+|]+$", "", value).strip()
+                
+                if value:
+                    # SIGNAL: If we find a key that is ALREADY in current_record, 
+                    # it implies a new record might have started (e.g. we see "Name" again).
+                    # Exception: "address" and "address 2" -> usually we want specific keys for line 2
+                    # But if we see 'number' again, definitely new record.
+                    if field in current_record and field in ['number', 'name', 'card_number', 'email']:
+                        flush_record(current_record)
+                        current_record = {}
+                    
+                    # Store value
+                    # For address, append if we see address lines?
+                    if field == 'address' and 'address' in current_record:
+                         current_record['address'] += f", {value}"
+                    else:
+                        current_record[field] = value
+                    
+                    found_key = True
+                    break # Found a match for this line
+            if found_key:
+                break
+    
+    # Flush last record
+    flush_record(current_record)
+    
     return records
 
 
@@ -1666,27 +1720,25 @@ def parse_bk_fullz_format(text):
 async def receive_numbers(message: Message, state: FSMContext):
     data = await state.get_data()
     numbers = data.get('numbers', [])
-    
     text = message.text
     
-    # 1. Try passing as Bk Fullz format first
-    if "Personal Information" in text and "Card Information" in text:
-        bk_records = parse_bk_fullz_format(text)
-        if bk_records:
-            # We found records!
-            # Extend existing list (handle mixed types if necessary, but usually one batch is one type)
-            try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, add_records_from_csv, bk_records)
-                await message.answer(f"✅ <b>Parsed & Added {len(bk_records)} Fullz records!</b>", parse_mode="HTML")
-                await state.clear()
-                return
-            except Exception as e:
-                await message.answer(f"❌ Error adding fullz: {e}")
-                logging.error(f"Fullz add error: {e}")
-                return
-
+    # 1. Try generic mixed format parser
+    # It catches almost anything with "Phone:" or "Mobile:" labels
+    try:
+        mixed_records = parse_mixed_formats(text)
+        if mixed_records:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, add_records_from_csv, mixed_records)
+            await message.answer(f"✅ <b>Parsed & Added {len(mixed_records)} records (Mixed Format)!</b>", parse_mode="HTML")
+            await state.clear()
+            return
+    except Exception as e:
+        logging.error(f"Mixed parse error: {e}")
+        # Don't return, fall through to CSV parser just in case
+    
     # 2. Fallback to existing CSV parser
+    # ... (CSV logic) ...
+
     # Parse as CSV with proper quote handling
     csv_reader = csv.reader(io.StringIO(message.text))
 
