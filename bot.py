@@ -36,7 +36,7 @@ else:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
 REFERENCE = 'CB2061'
 
 
@@ -45,7 +45,7 @@ REFERENCE = 'CB2061'
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': '',
+    'password': '3kkxb7jdfh',
     'database': os.getenv("DB_NAME"),
     'charset': 'utf8mb4',
     'cursorclass': DictCursor
@@ -395,11 +395,14 @@ def get_next_number(user_id: int, username: str = None, force_new: bool = False)
 
             # Get first unused number - EXCLUDE COMPLETED
             cursor.execute(
-                """SELECT id, number, name, address, email, 
-                          card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn 
-                   FROM number_queue 
-                   WHERE is_used = FALSE AND is_completed = FALSE 
-                   ORDER BY id LIMIT 1"""
+                """SELECT id, number, name, address, email, added_at,
+                          card_holder, card_number, card_expiry, cvv, sortcode, account_number, bin_info, dob, mmn
+                   FROM number_queue
+                   WHERE is_used = FALSE
+                   AND name IS NOT NULL AND name != ''
+                   ORDER BY added_at ASC
+                   LIMIT 1
+                   FOR UPDATE SKIP LOCKED"""
             )
             result = cursor.fetchone()
 
@@ -1462,59 +1465,83 @@ async def handle_file_upload(message: Message, state: FSMContext, bot: Bot):
 
         content = file_content.read().decode('utf-8')
         
-        # 1. Try Mixed Format Parser first (for Bk fullz etc)
-        mixed_records = parse_mixed_formats(content)
-        if mixed_records:
-             records = mixed_records
-             await message.answer(f"✅ <b>Imported {len(records)} records (Mixed Format)!</b>", parse_mode="HTML")
-             
+        # 1. Try Standard CSV Parser FIRST
+        # This prevents Mixed Parser from hijacking valid CSVs that happen to contain keywords in cells
+        csv_records = []
+        is_valid_csv = False
+        
+        try:
+            # Parse as CSV with proper quote handling
+            csv_file = io.StringIO(content)
+            csv_reader = csv.reader(csv_file)
+            
+            # Read header and detect columns
+            header = next(csv_reader, None)
+            if header:
+                mapping = detect_column_mapping(header)
+                if mapping['number'] is not None:
+                    is_valid_csv = True
+                    for row in csv_reader:
+                        if len(row) < 2:  # Skip empty rows
+                            continue
+
+                        # Extract based on detected mapping
+                        number = row[mapping['number']].strip() if mapping['number'] is not None else None
+                        
+                        # Fix index out of bounds if row is shorter than mapping detected in header
+                        name_idx = mapping['name']
+                        name = row[name_idx].strip() if name_idx is not None and len(row) > name_idx else None
+                        
+                        addr_idx = mapping['address']
+                        address = row[addr_idx].strip() if addr_idx is not None and len(row) > addr_idx else None
+                        
+                        email_idx = mapping['email']
+                        email = row[email_idx].strip() if email_idx is not None and len(row) > email_idx else None
+
+                        if number:  # Only add if number exists
+                             # USER RULE: Only import if name exists
+                            if not name:
+                                continue
+                            csv_records.append((number, name, address, email))
+        except Exception as e:
+            logging.warning(f"CSV Parse failed: {e}")
+            
+        if is_valid_csv and csv_records:
              loop = asyncio.get_event_loop()
-             await loop.run_in_executor(None, add_records_from_csv, records)
+             await loop.run_in_executor(None, add_records_from_csv, csv_records)
+
+             # Show detected mapping
+             cols_found = [f"{k.title()}: Col {v + 1}" for k, v in mapping.items() if v is not None]
+             await message.answer(
+                 f"✅ <b>Imported {len(csv_records)} records!</b>\n\n"
+                 f"📋 Detected columns:\n• " + "\n• ".join(cols_found),
+                 parse_mode="HTML"
+             )
              await state.clear()
              return
 
-        # 2. Fallback to CSV
-        csv_reader = csv.reader(io.StringIO(content))
 
-        # Read header and detect columns
-        header = next(csv_reader)
-        mapping = detect_column_mapping(header)
-
-        # Validate we found number column
-        if mapping['number'] is None:
-            await message.answer("❌ Could not detect 'Number' column!")
-            await state.clear()
-            return
-
-        records = []
-        for row in csv_reader:
-            if len(row) < 2:  # Skip empty rows
-                continue
-
-            # Extract based on detected mapping
-            number = row[mapping['number']].strip() if mapping['number'] is not None else None
-            name = row[mapping['name']].strip() if mapping['name'] is not None and len(row) > mapping['name'] else None
-            address = row[mapping['address']].strip() if mapping['address'] is not None and len(row) > mapping[
-                'address'] else None
-            email = row[mapping['email']].strip() if mapping['email'] is not None and len(row) > mapping[
-                'email'] else None
-
-            if number:  # Only add if number exists
-                records.append((number, name, address, email))
-
-        if records:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, add_records_from_csv, records)
-
-            # Show detected mapping
-            cols_found = [f"{k.title()}: Col {v + 1}" for k, v in mapping.items() if v is not None]
-            await message.answer(
-                f"✅ <b>Imported {len(records)} records!</b>\n\n"
-                f"📋 Detected columns:\n• " + "\n• ".join(cols_found),
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer("❌ No valid records found!")
+        # 2. Key-Value Mixed Format Parser (Fallback for Bk fullz etc)
+        # Only reached if CSV failed or found nothing relevant
+        try:
+            mixed_records = parse_mixed_formats(content)
+            # Filter: Only keep records with name
+            mixed_records = [r for r in mixed_records if r[1] and r[1].strip()]
+            
+            if mixed_records:
+                 loop = asyncio.get_event_loop()
+                 await loop.run_in_executor(None, add_records_from_csv, mixed_records)
+                 
+                 await message.answer(
+                     f"✅ <b>Imported {len(mixed_records)} records (Mixed Format)!</b>", 
+                     parse_mode="HTML"
+                 )
+                 await state.clear()
+                 return
+        except Exception as e:
+            logging.error(f"Mixed parse in upload failed: {e}")
+        
+        await message.answer("❌ No valid records found (checked CSV and Text formats). Ensure 'Number' and 'Name' columns are present.")
 
     except Exception as e:
         logging.error(f"Error: {e}")
@@ -1677,6 +1704,10 @@ def parse_mixed_formats(text):
             # If no name but card holder exists, use card holder?
             if not name and rec.get('card_holder'):
                 name = rec['card_holder']
+
+            # USER CONSTRAINT: Only import if NAME exists
+            if not name or not name.strip():
+                return
 
             records.append((
                 mobile,
